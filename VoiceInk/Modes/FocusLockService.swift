@@ -193,7 +193,15 @@ final class FocusLockService: ObservableObject {
     // (so the caret is in the right field, not just the right app).
     @discardableResult
     func restoreFocusToLock() -> Bool {
-        guard let target = lockedTarget else { return false }
+        // PROVABLE NO-OP WHEN NO LOCK IS ACTIVE (short-press / default path).
+        // isLockActive is kept perfectly in sync with lockedTarget via the single
+        // writer setLockedTarget(_:), so `lockedTarget == nil` ⇔ `isLockActive == false`.
+        // On a normal short press the lock never arms (lockedTarget stays nil), so we
+        // return here IMMEDIATELY having read nothing and touched NO focus — the paste
+        // then goes to the live frontmost field exactly like upstream. This early
+        // return is the load-bearing guarantee that Feature A can't affect the
+        // non-locked paste path; do not move any focus-touching code above it.
+        guard isLockActive, let target = lockedTarget else { return false }
 
         guard AXIsProcessTrusted() else {
             // Permission was revoked mid-session. Can't restore — fall back to
@@ -208,6 +216,58 @@ final class FocusLockService: ObservableObject {
             logger.error("restoreFocusToLock: locked app terminated; default delivery")
             return true
         }
+
+        // ────────────────────────────────────────────────────────────────────────
+        // REGRESSION GUARD (2026-06-17): "normal dictation pastes NOTHING".
+        //
+        // THE BUG: the default record mode is HYBRID, and the natural push-to-talk
+        // gesture for an ordinary dictation is to HOLD the hotkey for the whole
+        // utterance — which is almost always > longPressThreshold (450ms). That hold
+        // PROMOTES a focus lock even though the user never moved focus and never
+        // wanted the "land it back in the start field" behavior. At delivery we then
+        // ran the full restore dance (app.activate() + AXUIElementSetAttributeValue
+        // of kAXFocusedUIElement to the element captured 450ms+ earlier). By delivery
+        // that captured element is frequently STALE (the field re-rendered, the app
+        // re-laid-out, the AX identity changed), so forcing focus onto it — or simply
+        // re-activating + re-focusing immediately before the Cmd+V CGEvent — created a
+        // focus race that swallowed the paste. Net effect for a perfectly normal hold
+        // dictation: recorder shows "transcribing", disappears, and NOTHING is pasted.
+        //
+        // THE GUARD: a lock only NEEDS a restore when focus has ACTUALLY moved away
+        // from where the user started (the genuine long-press-then-click-elsewhere
+        // flow). If the locked app is STILL frontmost AND the live system-wide focused
+        // element is STILL the element we captured, the user never went anywhere — so
+        // we must touch NOTHING and let the paste land in the live focused field,
+        // EXACTLY like upstream did before Feature A existed. Touching focus in that
+        // case is pure downside: at best a no-op, at worst the paste-dropping race
+        // above. This makes a normal (even long-held) single-field dictation behave
+        // identically to upstream, while the click-away flow still restores correctly.
+        let systemWide = AXUIElementCreateSystemWide()
+        var liveFocusedRef: CFTypeRef?
+        let liveResult = AXUIElementCopyAttributeValue(
+            systemWide,
+            kAXFocusedUIElementAttribute as CFString,
+            &liveFocusedRef
+        )
+        let frontmostApp = NSWorkspace.shared.frontmostApplication
+        if liveResult == .success,
+           let liveFocusedRef,
+           frontmostApp?.processIdentifier == target.pid {
+            let liveElement = liveFocusedRef as! AXUIElement
+            // CFEqual is the correct identity check for AXUIElement refs (they're
+            // CFTypeRefs; == on the Swift wrapper is NOT reliable). Same app frontmost
+            // + same focused element => user never moved => leave focus completely
+            // alone and let the normal paste path run.
+            if CFEqual(liveElement, target.element) {
+                logger.notice("restoreFocusToLock: focus unchanged (same app + same field) — no-op, normal paste")
+                return true
+            }
+        }
+
+        // From here, focus HAS genuinely moved (different app frontmost, or a
+        // different focused element): this is the real long-press → click-away case
+        // the lock exists for. Perform the restore so the transcript lands back in
+        // the originally-focused field.
 
         // (a) Re-activate the owning app so it's frontmost for the paste keystroke.
         // Brings it forward even though VoiceInk (or whatever Ethan clicked into) is
