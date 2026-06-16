@@ -335,6 +335,43 @@ struct LiveTranscriptView: View {
     }
 }
 
+// MARK: - Focus Lock Indicator
+//
+// Small, unobtrusive caption shown ABOVE the waveform in the recorder UI to tell
+// Ethan that the CURRENT recording is in the long-press "lock the start field"
+// capture mode (Feature A — see FocusLockService). When that mode is NOT active
+// (an ordinary short-press recording) the view collapses to nothing, so a normal
+// recording shows no label at all.
+//
+// Reactivity: observes FocusLockService.shared (an ObservableObject). The
+// service's @Published `isLockActive` flips true when promoteToLock() arms the
+// lock at record-start and false when clearLock() releases it at delivery/end —
+// so this caption appears/disappears live alongside the lock, including clearing
+// itself before any subsequent short-press recording.
+struct FocusLockIndicator: View {
+    // shared singleton; @ObservedObject so SwiftUI re-renders when isLockActive flips.
+    @ObservedObject private var focusLock = FocusLockService.shared
+
+    var body: some View {
+        Group {
+            if focusLock.isLockActive {
+                // Subtle footnote-weight caption. Secondary white opacity + small
+                // size so it sits quietly above the waveform without competing with
+                // it, but stays legible on the recorder's black background. The
+                // exact string is intentional — do not reword.
+                Text("Using input from voice start")
+                    .font(.system(size: 10, weight: .medium))
+                    .foregroundColor(.white.opacity(0.55))
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.7)
+                    .transition(.opacity)
+                    .accessibilityLabel(Text("Using input from voice start"))
+            }
+        }
+        .animation(.easeInOut(duration: 0.2), value: focusLock.isLockActive)
+    }
+}
+
 // MARK: - Recorder Status Display
 
 struct RecorderStatusDisplay: View {

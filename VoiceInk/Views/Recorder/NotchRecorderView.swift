@@ -4,6 +4,10 @@ struct NotchRecorderView<S: RecorderStateProvider & ObservableObject>: View {
     @ObservedObject var stateProvider: S
     @ObservedObject var recorder: Recorder
     @ObservedObject var assistantSession: AssistantSession
+    // Observe the focus-lock service so the pill re-renders (and pillHeight
+    // recomputes to make room for the indicator row) when a long-press lock
+    // arms/clears at record-start/end.
+    @ObservedObject private var focusLock = FocusLockService.shared
     let onRecordButtonTapped: () -> Void
     let onCloseTapped: () -> Void
     let onAssistantFollowUp: (String) -> Void
@@ -58,6 +62,10 @@ struct NotchRecorderView<S: RecorderStateProvider & ObservableObject>: View {
     private let activeHeightBonus: CGFloat = 6
     private let transcriptPanelHeight: CGFloat = 57
     private let assistantPanelHeight: CGFloat = 320
+    // Extra vertical space the pill grows by when the focus-lock indicator is
+    // showing above the main row. Only added while the lock is active AND the
+    // pill is expanded (not collapsed) — see focusLockIndicatorHeight.
+    private let focusLockIndicatorRowHeight: CGFloat = 14
 
     private var mainRowHeight: CGFloat { notchHeight + activeHeightBonus }
 
@@ -72,13 +80,24 @@ struct NotchRecorderView<S: RecorderStateProvider & ObservableObject>: View {
         }
     }
 
+    // Height contributed by the focus-lock indicator row. Zero unless the lock is
+    // active AND the pill is expanded — we never want it to push the collapsed
+    // (hidden) notch open on its own.
+    private var focusLockIndicatorHeight: CGFloat {
+        (focusLock.isLockActive && displayState != .collapsed) ? focusLockIndicatorRowHeight : 0
+    }
+
     private var pillHeight: CGFloat {
+        let base: CGFloat
         switch displayState {
-        case .collapsed: return 0
-        case .active:    return mainRowHeight
-        case .liveText:  return mainRowHeight + transcriptPanelHeight
-        case .assistant: return mainRowHeight + assistantPanelHeight
+        case .collapsed: base = 0
+        case .active:    base = mainRowHeight
+        case .liveText:  base = mainRowHeight + transcriptPanelHeight
+        case .assistant: base = mainRowHeight + assistantPanelHeight
         }
+        // Add the indicator row's height so the pill grows to fit the caption
+        // without clipping the waveform/main row below it.
+        return base + focusLockIndicatorHeight
     }
 
     private var sideExpansion: CGFloat {
@@ -129,6 +148,12 @@ struct NotchRecorderView<S: RecorderStateProvider & ObservableObject>: View {
 
     private var pill: some View {
         VStack(spacing: 0) {
+            // Capture-mode indicator sits ABOVE the main row (which holds the
+            // waveform / AudioVisualizer on its right side). Only takes vertical
+            // space + renders when the long-press focus lock is active; for a
+            // normal short-press recording it's an empty zero-height view so the
+            // notch pill looks unchanged. See focusLockIndicatorRow.
+            focusLockIndicatorRow
             mainRow
             liveTextPanel
             assistantPanel
@@ -141,6 +166,20 @@ struct NotchRecorderView<S: RecorderStateProvider & ObservableObject>: View {
                 bottomCornerRadius: displayState == .liveText || displayState == .assistant ? 22 : 16
             )
         )
+    }
+
+    // MARK: - Focus Lock Indicator Row
+
+    // Thin centered row above the main row that shows the FocusLockIndicator
+    // caption ("Using input from voice start") when the long-press lock is active.
+    // Collapses to zero height when inactive (or while the notch is collapsed) so
+    // a normal short-press recording leaves the pill unchanged. Clipped so the
+    // caption never spills outside the rounded notch shape during the animation.
+    private var focusLockIndicatorRow: some View {
+        FocusLockIndicator()
+            .frame(maxWidth: .infinity)
+            .frame(height: focusLockIndicatorHeight)
+            .clipped()
     }
 
     // MARK: - Main Row

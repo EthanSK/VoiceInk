@@ -91,6 +91,15 @@ struct MiniRecorderView<S: RecorderStateProvider & ObservableObject>: View {
             } else {
                 transcriptSection
             }
+            // Capture-mode indicator sits directly ABOVE the control bar (which
+            // contains the live waveform / AudioVisualizer via RecorderStatusDisplay).
+            // Only renders when the long-press focus lock is active for this
+            // recording; otherwise it's an empty/zero-height view so a normal
+            // short-press recording shows nothing here. Centered to line up over
+            // the waveform, which is centered in the control bar.
+            FocusLockIndicator()
+                .frame(maxWidth: .infinity)
+                .padding(.top, hasLiveTranscript || hasAssistantResponse ? 4 : 6)
             controlBar
         }
         .frame(width: hasAssistantResponse ? assistantWidth : (hasLiveTranscript ? expandedWidth : compactWidth))

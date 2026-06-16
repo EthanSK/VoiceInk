@@ -40,8 +40,16 @@ import os
 //   wouldn't work anyway. Every AX call here degrades gracefully: if the system
 //   doesn't return a focused element, or the stored element is gone/invalid at
 //   delivery, we simply fall back to the default (frontmost) delivery path.
+// NOTE: ObservableObject conformance (added for the recorder-UI indicator).
+// The recorder views (MiniRecorderView / NotchRecorderView) show a small caption
+// — "Using input from voice start" — ABOVE the waveform whenever a long-press
+// focus lock is armed for the CURRENT recording. SwiftUI needs to observe that
+// state to update live, so we publish `isLockActive` and bump it in the two
+// places the lock transitions (promoteToLock arms it, clearLock releases it).
+// @MainActor keeps all mutation on the main thread, which is also where SwiftUI
+// reads @Published — so no actor hops / threading issues for the observers.
 @MainActor
-final class FocusLockService {
+final class FocusLockService: ObservableObject {
     static let shared = FocusLockService()
 
     private let logger = Logger(subsystem: "com.prakashjoshipax.voiceink", category: "FocusLock")
@@ -73,8 +81,27 @@ final class FocusLockService {
     // True while a long-press lock is committed. ActiveWindowService reads this to
     // SUPPRESS the #785 frontmost-app-follow for the locked session — otherwise an
     // app switch mid-recording would clobber the Mode/auto-send we want for the
-    // ORIGINAL field.
-    var isLockActive: Bool { lockedTarget != nil }
+    // ORIGINAL field. ALSO drives the recorder-UI "Using input from voice start"
+    // indicator above the waveform.
+    //
+    // This is a @Published STORED property (not a computed one) so SwiftUI's
+    // ObservableObject machinery fires objectWillChange when it flips — a computed
+    // `lockedTarget != nil` would never notify observers. It is kept perfectly in
+    // sync with `lockedTarget` via the single mutation helper below: every place
+    // that sets/clears `lockedTarget` goes through `setLockedTarget(_:)`, which is
+    // the ONLY writer of both fields. Invariant: isLockActive == (lockedTarget != nil).
+    @Published private(set) var isLockActive: Bool = false
+
+    // Single chokepoint for mutating the lock so the @Published `isLockActive`
+    // mirror can never drift from `lockedTarget`. MainActor-isolated, so the
+    // @Published write happens on the main thread where SwiftUI observes it.
+    private func setLockedTarget(_ newValue: Candidate?) {
+        lockedTarget = newValue
+        let active = newValue != nil
+        if isLockActive != active {
+            isLockActive = active
+        }
+    }
 
     // STEP 1 (key-down): snapshot the currently-focused UI element + its owning app.
     // We capture UNCONDITIONALLY on every record-start key-down because at this
@@ -142,7 +169,9 @@ final class FocusLockService {
             logger.debug("promoteToLock: no candidate to promote")
             return
         }
-        lockedTarget = candidate
+        // Route through setLockedTarget so the @Published isLockActive flips and
+        // the recorder UI shows "Using input from voice start" for this recording.
+        setLockedTarget(candidate)
         logger.notice("Focus lock ARMED on \(candidate.bundleId ?? "unknown", privacy: .public) (long-press)")
     }
 
@@ -217,7 +246,10 @@ final class FocusLockService {
         if lockedTarget != nil {
             logger.debug("clearLock: releasing focus lock")
         }
-        lockedTarget = nil
+        // Route through setLockedTarget so the @Published isLockActive flips back
+        // to false and the recorder UI HIDES the indicator. This is what makes a
+        // later short-press recording NOT still show "Using input from voice start".
+        setLockedTarget(nil)
         candidate = nil
     }
 }
