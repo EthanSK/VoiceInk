@@ -68,6 +68,14 @@ class ActiveWindowService: ObservableObject {
     private func handleFrontmostAppActivation(_ app: NSRunningApplication) {
         guard let bundleIdentifier = app.bundleIdentifier else { return }
 
+        // Feature A (focus lock): if a long-press focus lock is active, the user has
+        // DELIBERATELY pinned delivery to the field they started in. Suppress the
+        // #785 frontmost-follow for this session — otherwise clicking into another
+        // app mid-recording would re-resolve the Mode/auto-send to that other app,
+        // which is exactly the behavior the lock is meant to override. The locked
+        // session keeps whatever Mode was resolved at record-start.
+        if FocusLockService.shared.isLockActive { return }
+
         // Ignore activations of VoiceInk itself — when the user clicks back into our
         // own window (e.g. settings, or the recorder if it ever takes focus) we must
         // NOT clobber the Mode resolved for their real target app.

@@ -355,6 +355,12 @@ final class RecordingShortcutModeHandler {
     private var activeShortcutCanCancelAccidentalStart = false
     private var lastShortcutPressTime: Date?
 
+    // Feature A (focus lock): pending timer that, if the record hotkey is still
+    // held when it fires, promotes the focus captured at key-down into an active
+    // lock. Cancelled on key-up so a short press never arms the lock. See
+    // FocusLockService for the full rationale.
+    private var longPressLockTask: Task<Void, Never>?
+
     private let shortcutPressCooldown: TimeInterval = 0.5
     private let hybridPressThreshold: TimeInterval = 0.5
 
@@ -379,6 +385,13 @@ final class RecordingShortcutModeHandler {
         activeRecordingShortcutAction = nil
         interruptedRecordingActions.removeAll()
         activeShortcutCanCancelAccidentalStart = false
+
+        // Feature A (focus lock): a full reset (monitor restart, accidental-start
+        // cancel) must tear down any pending arm-timer AND any captured/locked
+        // focus so a stale lock can't leak into the next recording.
+        longPressLockTask?.cancel()
+        longPressLockTask = nil
+        FocusLockService.shared.clearLock()
     }
 
     func handleKeyDown(
@@ -404,6 +417,35 @@ final class RecordingShortcutModeHandler {
         activeShortcutCanCancelAccidentalStart = canCurrentShortcutPressCancelAccidentalStart
         lastShortcutPressTime = Date()
         shortcutPressStartTime = eventTime
+
+        // Feature A (focus lock): does THIS key-down START a fresh recording?
+        // Only a key-down that begins recording (recorder not currently visible,
+        // and we're not toggling-off a hands-free session) is a candidate for the
+        // long-press focus lock. We must snapshot the focused field NOW, at the
+        // very start of the press, because that's the only instant the original
+        // field is reliably still focused (Ethan may click away immediately after).
+        let startsFreshRecording = !isRecorderVisible() && !isHandsFreeRecording
+        if startsFreshRecording {
+            // Capture the currently-focused element unconditionally — we don't yet
+            // know if this is a long press. If the key is released before the
+            // threshold, handleKeyUp cancels the timer and clears the candidate
+            // (short-press => default behavior, nothing locked).
+            FocusLockService.shared.captureCandidate()
+
+            // Arm the long-press timer: if the hotkey is STILL held when this fires,
+            // promote the candidate to an active lock (and suppress #785 follow).
+            longPressLockTask?.cancel()
+            longPressLockTask = Task { @MainActor [weak self] in
+                let thresholdNanos = UInt64(FocusLockService.longPressThreshold * 1_000_000_000)
+                try? await Task.sleep(nanoseconds: thresholdNanos)
+                guard let self, !Task.isCancelled else { return }
+                // Re-check the key is genuinely still down for THIS action — guards
+                // against a race where key-up landed just as the timer fired.
+                guard self.isShortcutPressed,
+                      self.activeRecordingShortcutAction == action else { return }
+                FocusLockService.shared.promoteToLock()
+            }
+        }
 
         switch mode {
         case .toggle, .hybrid:
@@ -437,6 +479,21 @@ final class RecordingShortcutModeHandler {
         isShortcutPressed = false
         activeRecordingShortcutAction = nil
         activeShortcutCanCancelAccidentalStart = false
+
+        // Feature A (focus lock): the press has ended — resolve long vs short.
+        // Cancel the pending arm-timer first so it can't fire after release.
+        longPressLockTask?.cancel()
+        longPressLockTask = nil
+        if let pressStart = shortcutPressStartTime {
+            let pressDuration = eventTime - pressStart
+            if pressDuration < FocusLockService.longPressThreshold {
+                // SHORT press: discard the field we captured at key-down. The lock
+                // never arms, so delivery uses the default frontmost path (#785).
+                // (If the lock already armed — i.e. a long hold — promoteToLock has
+                // run; we deliberately do NOT clear it here.)
+                FocusLockService.shared.clearCandidate()
+            }
+        }
 
         switch mode {
         case .toggle:

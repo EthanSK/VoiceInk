@@ -23,6 +23,19 @@ final class TranscriptionDelivery {
     }
 
     func deliver(_ request: Request, actions: Actions) async {
+        // Feature A (focus lock): ONLY the paste path consumes a focus lock. Every
+        // other delivery outcome below (incomplete transcription, assistant
+        // follow-up, respond mode, custom command, or empty text) must release any
+        // armed lock here so it can't leak into the next recording. The paste path
+        // does its own restore+clear, so we leave the lock intact only for it.
+        let isPlainPaste = !request.isAssistantFollowUp
+            && request.output.outputMode == .paste
+            && request.text != nil
+            && request.transcription.transcriptionStatus == TranscriptionStatus.completed.rawValue
+        if !isPlainPaste {
+            FocusLockService.shared.clearLock()
+        }
+
         guard request.transcription.transcriptionStatus == TranscriptionStatus.completed.rawValue else {
             await actions.dismiss()
             return
@@ -154,6 +167,16 @@ final class TranscriptionDelivery {
         SoundManager.shared.playStopSound()
         await actions.dismiss()
 
+        // Feature A (focus lock): if a long-press locked a target field at
+        // record-start, re-activate its app and restore AX focus to that element
+        // BEFORE we paste, so the transcript lands back in the ORIGINAL field even
+        // though the user may have clicked elsewhere. No-op (returns false) when no
+        // lock is active -> normal frontmost paste. We restore here, on the main
+        // actor, immediately before issuing the paste keystroke so nothing can
+        // steal focus in between. The lock is cleared at the end of this delivery
+        // (in the Task below) so it can never leak into the next recording.
+        FocusLockService.shared.restoreFocusToLock()
+
         let pasteTask = CursorPaster.startPasteAtCursor(pastedText)
 
         let autoSendKey = output.outputMode == .paste ? output.autoSendKey : .none
@@ -164,6 +187,11 @@ final class TranscriptionDelivery {
                 try? await Task.sleep(nanoseconds: 500_000_000)
                 CursorPaster.performAutoSend(autoSendKey)
             }
+
+            // Feature A: delivery is done — always release the focus lock so the
+            // next recording starts clean (default frontmost behavior). Safe/idempotent
+            // even when no lock was ever armed.
+            FocusLockService.shared.clearLock()
         }
     }
 
