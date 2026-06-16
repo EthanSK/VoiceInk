@@ -181,9 +181,13 @@ final class FocusLockService {
         }
 
         // (a) Re-activate the owning app so it's frontmost for the paste keystroke.
-        // .activateIgnoringOtherApps brings it forward even though VoiceInk (or
-        // whatever Ethan clicked into) is currently frontmost.
-        target.app.activate(options: [.activateIgnoringOtherApps])
+        // Brings it forward even though VoiceInk (or whatever Ethan clicked into) is
+        // currently frontmost. macOS 14 deprecated the options-based
+        // NSRunningApplication.activate(options:) (the .activateIgnoringOtherApps
+        // option in particular) — the no-arg activate() is the supported replacement
+        // and already implies "bring this app forward". (NSApplication's separate
+        // activate(ignoringOtherApps:) is a different API and stays as-is elsewhere.)
+        target.app.activate()
 
         // (b) Restore AX focus to the exact element. We set kAXFocusedUIElement on
         // the APP-level AX element (the documented way to move focus to a child
