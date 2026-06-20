@@ -335,7 +335,7 @@ final class FocusLockService: ObservableObject {
         // VIPPDebug: lock lifecycle END — whatever lock (if any) existed is released
         // and isLockActive flips false. wasActive tells us whether this clear actually
         // tore down a live lock vs was a no-op. Pairs with the ARM line above.
-        vippLog.info("focuslock: clearLock (lock lifecycle end) wasActive=\(lockedTarget != nil)")
+        vippLog.info("focuslock: clearLock (lock lifecycle end) wasActive=\(self.lockedTarget != nil)")
         // Route through setLockedTarget so the @Published isLockActive flips back
         // to false and the recorder UI HIDES the indicator. This is what makes a
         // later short-press recording NOT still show "Using input from voice start".
