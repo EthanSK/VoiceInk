@@ -1,5 +1,6 @@
 import Foundation
 import AppKit
+import os
 
 @MainActor
 class RecordingShortcutManager: ObservableObject {
@@ -347,6 +348,13 @@ final class RecordingShortcutModeHandler {
     private let toggleRecorderPanel: @MainActor (UUID?) async -> Void
     private let cancelRecording: @MainActor () async -> Void
 
+    // VIPPDebug: VoiceInk++-only diagnostic logger (NOT the base voiceink logger).
+    // Surfaces the press lifecycle — key-down capture, long-press timer arm/fire,
+    // key-up short-vs-long resolution — so we can correlate the shortcut handler's
+    // view of the press against FocusLockService's lock lifecycle in one stream.
+    // Subsystem matches FocusLockService.vippLog so a single predicate catches both.
+    private let vippLog = Logger(subsystem: "com.ethansk.VoiceInkPlusPlus", category: "VIPPDebug")
+
     private var shortcutPressStartTime: TimeInterval?
     private var isHandsFreeRecording = false
     private var isShortcutPressed = false
@@ -432,9 +440,19 @@ final class RecordingShortcutModeHandler {
             // (short-press => default behavior, nothing locked).
             FocusLockService.shared.captureCandidate()
 
+            // VIPPDebug: proves a fresh-recording key-down fired and we attempted a
+            // candidate capture. startsFresh==true here by construction; action tells
+            // us primary vs secondary. If this line is missing for a press, the
+            // key-down never reached the capture point (e.g. toggling-off hands-free).
+            vippLog.info("shortcut: key-down captured startsFresh=true action=\(String(describing: action), privacy: .public)")
+
             // Arm the long-press timer: if the hotkey is STILL held when this fires,
             // promote the candidate to an active lock (and suppress #785 follow).
             longPressLockTask?.cancel()
+            // VIPPDebug: the long-press timer ARMED. Pair this with either the FIRED
+            // line below (held past threshold) or its ABSENCE (key-up cancelled it) to
+            // see whether a given press was a genuine long-hold or a short tap.
+            vippLog.info("shortcut: long-press timer ARMED threshold=\(FocusLockService.longPressThreshold) action=\(String(describing: action), privacy: .public)")
             longPressLockTask = Task { @MainActor [weak self] in
                 let thresholdNanos = UInt64(FocusLockService.longPressThreshold * 1_000_000_000)
                 try? await Task.sleep(nanoseconds: thresholdNanos)
@@ -443,6 +461,10 @@ final class RecordingShortcutModeHandler {
                 // against a race where key-up landed just as the timer fired.
                 guard self.isShortcutPressed,
                       self.activeRecordingShortcutAction == action else { return }
+                // VIPPDebug: the timer SURVIVED to fire — the hotkey was still held at
+                // threshold, so we promote to a lock. Seeing this confirms the long-hold
+                // path ran (vs being cancelled at key-up). Compare with the ARMED line.
+                self.vippLog.info("shortcut: long-press timer FIRED → promoteToLock() action=\(String(describing: action), privacy: .public)")
                 FocusLockService.shared.promoteToLock()
             }
         }
@@ -491,7 +513,15 @@ final class RecordingShortcutModeHandler {
                 // never arms, so delivery uses the default frontmost path (#785).
                 // (If the lock already armed — i.e. a long hold — promoteToLock has
                 // run; we deliberately do NOT clear it here.)
+                // VIPPDebug: SHORT-press branch — duration under threshold, candidate
+                // discarded, no lock. Confirms this press should NOT engage Feature A.
+                vippLog.info("shortcut: key-up duration=\(pressDuration) < threshold=\(FocusLockService.longPressThreshold) → SHORT press, clearCandidate (discard, default paste)")
                 FocusLockService.shared.clearCandidate()
+            } else {
+                // VIPPDebug: LONG-hold branch — duration met/exceeded threshold, so the
+                // candidate captured at key-down is KEPT (the arm-timer should already
+                // have promoted it). Confirms this press is eligible for focus-lock.
+                vippLog.info("shortcut: key-up duration=\(pressDuration) >= threshold=\(FocusLockService.longPressThreshold) → LONG hold, candidate kept")
             }
         }
 

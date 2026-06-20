@@ -160,6 +160,10 @@ final class FocusLockService: ObservableObject {
             bundleId: app.bundleIdentifier
         )
         logger.debug("captureCandidate: stored focus in \(app.bundleIdentifier ?? "unknown", privacy: .public)")
+        // VIPPDebug: proves a candidate was successfully built at key-down (AX trusted,
+        // a focused element existed, owning app resolved). bundleId wrapped with
+        // ?? "nil" because it's a String? — os_log needs a non-optional interpolation.
+        vippLog.info("focuslock: candidate captured pid=\(pid, privacy: .public) bundle=\(app.bundleIdentifier ?? "nil", privacy: .public)")
     }
 
     // STEP 2 (held past threshold): promote the candidate to the committed lock.
@@ -177,12 +181,20 @@ final class FocusLockService: ObservableObject {
         // the recorder UI shows "Using input from voice start" for this recording.
         setLockedTarget(candidate)
         logger.notice("Focus lock ARMED on \(candidate.bundleId ?? "unknown", privacy: .public) (long-press)")
+        // VIPPDebug: the long-hold threshold was crossed and we committed the lock —
+        // isLockActive is now true so #785 frontmost-follow is suppressed for this
+        // session. bundleId is String? → ?? "nil". This is the moment delivery will
+        // later branch on (same-app no-op vs cross-app real restore).
+        vippLog.info("focuslock: LONG-HOLD threshold crossed → ARM lock bundle=\(candidate.bundleId ?? "nil", privacy: .public) pid=\(candidate.pid, privacy: .public)")
     }
 
     // SHORT-PRESS path: discard the candidate captured at key-down. Leaves any
     // already-committed lock untouched (there shouldn't be one for a short press,
     // but we never want a short press to drop a real lock).
     func clearCandidate() {
+        // VIPPDebug: short-press discard of the key-down candidate. Pairs with the
+        // captureCandidate line above to show a press that never armed a lock.
+        vippLog.info("focuslock: clearCandidate (short-press discard, no lock)")
         candidate = nil
     }
 
@@ -300,8 +312,15 @@ final class FocusLockService: ObservableObject {
             // Common when the field no longer exists (page navigated, sheet closed,
             // doc reloaded). Not fatal: the app is at least frontmost now.
             logger.error("restoreFocusToLock: AX setFocused failed (err \(setResult.rawValue)); relying on app activation")
+            // VIPPDebug: AX focus-set FAILED on the cross-app restore — paste may land
+            // in the wrong field or rely on app-activation alone. setResult.rawValue is
+            // an Int32; target is non-optional, bundleId is String? → ?? "nil".
+            vippLog.info("focuslock: AX restore FAIL (err=\(setResult.rawValue)) target pid=\(target.pid, privacy: .public) bundle=\(target.bundleId ?? "nil", privacy: .public)")
         } else {
             logger.notice("Focus lock RESTORED to \(target.bundleId ?? "unknown", privacy: .public)")
+            // VIPPDebug: AX focus-set SUCCEEDED — focus restored to the originally
+            // locked element in the cross-app case before the paste keystroke.
+            vippLog.info("focuslock: AX restore OK target pid=\(target.pid, privacy: .public) bundle=\(target.bundleId ?? "nil", privacy: .public)")
         }
 
         return true
@@ -313,6 +332,10 @@ final class FocusLockService: ObservableObject {
         if lockedTarget != nil {
             logger.debug("clearLock: releasing focus lock")
         }
+        // VIPPDebug: lock lifecycle END — whatever lock (if any) existed is released
+        // and isLockActive flips false. wasActive tells us whether this clear actually
+        // tore down a live lock vs was a no-op. Pairs with the ARM line above.
+        vippLog.info("focuslock: clearLock (lock lifecycle end) wasActive=\(lockedTarget != nil)")
         // Route through setLockedTarget so the @Published isLockActive flips back
         // to false and the recorder UI HIDES the indicator. This is what makes a
         // later short-press recording NOT still show "Using input from voice start".
