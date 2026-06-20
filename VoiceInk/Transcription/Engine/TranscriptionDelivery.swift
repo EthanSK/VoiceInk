@@ -1,9 +1,14 @@
 import Foundation
+import AppKit   // NSWorkspace (frontmost-app pid for VIPPDebug paste logging)
 import os
 
 @MainActor
 final class TranscriptionDelivery {
     private let logger = Logger(subsystem: "com.prakashjoshipax.voiceink", category: "TranscriptionDelivery")
+    // VIPPDebug: see RecorderUIManager for the filter predicate. Tracks which delivery
+    // branch runs and the actual paste (text length) so an empty/suppressed paste is
+    // distinguishable from a real one in the unified log.
+    private let vippLog = Logger(subsystem: "com.ethansk.VoiceInkPlusPlus", category: "VIPPDebug")
 
     struct Request {
         let transcription: Transcription
@@ -23,6 +28,7 @@ final class TranscriptionDelivery {
     }
 
     func deliver(_ request: Request, actions: Actions) async {
+        vippLog.info("deliver: enter status=\(request.transcription.transcriptionStatus, privacy: .public) outputMode=\(String(describing: request.output.outputMode), privacy: .public) textChars=\(request.text?.count ?? -1, privacy: .public) followUp=\(request.isAssistantFollowUp, privacy: .public)")
         // Feature A (focus lock): ONLY the paste path consumes a focus lock. Every
         // other delivery outcome below (incomplete transcription, assistant
         // follow-up, respond mode, custom command, or empty text) must release any
@@ -164,6 +170,7 @@ final class TranscriptionDelivery {
         let textToPaste = deliverableText(from: text)
         let appendSpace = UserDefaults.standard.bool(forKey: "AppendTrailingSpace")
         let pastedText = textToPaste + (appendSpace ? " " : "")
+        vippLog.info("paste: BEGIN len=\(pastedText.count, privacy: .public) lockActive=\(FocusLockService.shared.isLockActive, privacy: .public) frontmostPid=\(NSWorkspace.shared.frontmostApplication?.processIdentifier ?? -1, privacy: .public)")
         SoundManager.shared.playStopSound()
         await actions.dismiss()
 
@@ -175,7 +182,8 @@ final class TranscriptionDelivery {
         // actor, immediately before issuing the paste keystroke so nothing can
         // steal focus in between. The lock is cleared at the end of this delivery
         // (in the Task below) so it can never leak into the next recording.
-        FocusLockService.shared.restoreFocusToLock()
+        let didRestore = FocusLockService.shared.restoreFocusToLock()
+        vippLog.info("paste: restoreFocusToLock returned \(didRestore, privacy: .public); issuing paste keystroke now (frontmostPid=\(NSWorkspace.shared.frontmostApplication?.processIdentifier ?? -1, privacy: .public))")
 
         let pasteTask = CursorPaster.startPasteAtCursor(pastedText)
 

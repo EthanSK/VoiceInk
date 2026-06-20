@@ -27,6 +27,9 @@ class TranscriptionPipeline {
     private let enhancementService: AIEnhancementService?
     private let delivery = TranscriptionDelivery()
     private let logger = Logger(subsystem: "com.prakashjoshipax.voiceink", category: "TranscriptionPipeline")
+    // VIPPDebug: see RecorderUIManager for the filter predicate. Used to log the exact
+    // transcription request/result + every cancel-discard decision on this path.
+    private let vippLog = Logger(subsystem: "com.ethansk.VoiceInkPlusPlus", category: "VIPPDebug")
 
     init(
         modelContext: ModelContext,
@@ -95,6 +98,7 @@ class TranscriptionPipeline {
         }
 
         if shouldCancel() {
+            vippLog.info("pipeline: PRE-transcribe shouldCancel==true → finishCanceled (no network, no paste)")
             await finishCanceledTranscription()
             return
         }
@@ -102,6 +106,7 @@ class TranscriptionPipeline {
         do {
             let transcriptionStart = Date()
             var text: String
+            vippLog.info("pipeline: transcribe START model=\(model.displayName, privacy: .public) session=\(session != nil ? "streaming" : "file", privacy: .public)")
             if let session {
                 text = try await session.transcribe(audioURL: audioURL)
             } else {
@@ -113,8 +118,25 @@ class TranscriptionPipeline {
             }
             text = TranscriptionOutputFilter.filter(text)
             let transcriptionDuration = Date().timeIntervalSince(transcriptionStart)
+            vippLog.info("pipeline: transcribe SUCCESS chars=\(text.count, privacy: .public) elapsed=\(transcriptionDuration, format: .fixed(precision: 3), privacy: .public)s")
 
-            if shouldCancel() { await finishCanceledTranscription(); return }
+            // ───────────────────────────────────────────────────────────────────────
+            // FIX (2026-06-20, defensive guard for the same fork regression as the
+            // RecorderUIManager re-entrancy fix): a cancel that raced in AFTER the
+            // network round-trip already returned real text must NOT silently eat the
+            // user's words. Previously ANY shouldCancel()==true here discarded a perfectly
+            // good 200 transcription. Now we only treat a late cancel as "discard" when
+            // the returned text is actually EMPTY; non-empty text is delivered. The
+            // PRE-transcribe gate above still skips work before any network cost.
+            // ───────────────────────────────────────────────────────────────────────
+            if shouldCancel() {
+                if text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                    vippLog.info("pipeline: POST-transcribe shouldCancel==true AND empty text → finishCanceled (no paste)")
+                    await finishCanceledTranscription(); return
+                } else {
+                    vippLog.info("pipeline: POST-transcribe shouldCancel==true BUT text non-empty (chars=\(text.count, privacy: .public)) → DELIVER anyway (don't discard a finished 200)")
+                }
+            }
 
             text = text.trimmingCharacters(in: .whitespacesAndNewlines)
 
@@ -212,6 +234,12 @@ class TranscriptionPipeline {
             transcription.transcriptionStatus = TranscriptionStatus.completed.rawValue
         } catch {
             let errorDescription = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
+            // VIPPDebug: transcription threw. A URLError(.cancelled) here means the
+            // upload Task was torn down (the BrokenPipe-500 case at the proxy); any other
+            // error is a genuine network/decode failure. Either way the bar will hide
+            // with no paste — this line attributes which.
+            let isCancelled = (error as? URLError)?.code == .cancelled
+            vippLog.error("pipeline: transcribe FAILED isCancelled=\(isCancelled, privacy: .public) error=\(errorDescription, privacy: .public)")
 
             if let nativeAppleError = error as? NativeAppleTranscriptionService.ServiceError,
                nativeAppleError.shouldShowNotification {
@@ -252,11 +280,22 @@ class TranscriptionPipeline {
             }
         }
 
+        // FINAL pre-delivery cancel gate. Same defensive logic as the post-transcribe
+        // gate: only discard if there is NO usable text to deliver. If we have a real
+        // finalText, deliver it even if a late cancel raced in — discarding a completed
+        // 200 here is the exact "nothing pasted" symptom.
         if shouldCancel() {
-            await finishCanceledTranscription()
-            return
+            let hasText = !(finalText?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ?? true)
+            if !hasText {
+                vippLog.info("pipeline: PRE-delivery shouldCancel==true AND no text → finishCanceled (no paste)")
+                await finishCanceledTranscription()
+                return
+            } else {
+                vippLog.info("pipeline: PRE-delivery shouldCancel==true BUT finalText present → DELIVER anyway")
+            }
         }
 
+        vippLog.info("pipeline: about to DELIVER finalChars=\(finalText?.count ?? -1, privacy: .public) outputMode=\(String(describing: outputForDelivery?.outputMode), privacy: .public)")
         await delivery.deliver(
             TranscriptionDelivery.Request(
                 transcription: transcription,

@@ -64,6 +64,12 @@ class RecorderUIManager: ObservableObject, RecorderPanelPresenting {
 
     private let logger = Logger(subsystem: "com.prakashjoshipax.voiceink", category: "RecorderUIManager")
 
+    // VIPPDebug: dedicated unified-log channel for the records→transcribe→paste→hide
+    // path so the fork's "transcribing briefly then bar hides, nothing pasted" bug is
+    // observable. Filter with:
+    //   log stream --predicate 'subsystem == "com.ethansk.VoiceInkPlusPlus" && category == "VIPPDebug"'
+    private let vippLog = Logger(subsystem: "com.ethansk.VoiceInkPlusPlus", category: "VIPPDebug")
+
     init() {}
 
     /// Call after VoiceInkEngine is created to break the circular init dependency.
@@ -162,12 +168,43 @@ class RecorderUIManager: ObservableObject, RecorderPanelPresenting {
     func toggleRecorderPanel(modeId: UUID? = nil) async {
         guard let engine = engine else { return }
 
+        vippLog.info("toggleRecorderPanel: enter panelVisible=\(self.isRecorderPanelVisible, privacy: .public) state=\(String(describing: engine.recordingState), privacy: .public) modeId=\(modeId?.uuidString ?? "nil", privacy: .public)")
+
         if isRecorderPanelVisible {
             switch engine.recordingState {
             case .recording:
                 await engine.toggleRecord(modeId: modeId)
-            case .starting, .transcribing, .enhancing:
+            case .starting:
+                // Pre-recording: a re-press here genuinely cancels a not-yet-started
+                // session, so cancelling is correct.
+                vippLog.info("toggleRecorderPanel: .starting → cancelRecording")
                 await cancelRecording()
+            case .transcribing, .enhancing:
+                // ───────────────────────────────────────────────────────────────
+                // FIX (2026-06-20, fork regression): "records → 'transcribing' for
+                // a blink → bar hides instantly → NOTHING pasted (proxy logs mixed
+                // 200s + 500 BrokenPipe)".
+                //
+                // ROOT CAUSE: the stop happens via toggleRecorderPanel (HYBRID key-up)
+                // which then AWAITS the whole batch pipeline INLINE (VoiceInkEngine
+                // .toggleRecord → runPipeline → urlSession.upload). That await frees the
+                // MainActor, so a stray record-shortcut event — key-repeat, a quick
+                // re-press to start the NEXT dictation, the hybrid key-up re-dispatch,
+                // or a modifier-combo interruption — re-enters toggleRecorderPanel while
+                // state == .transcribing and USED to fall straight into cancelRecording().
+                // That poisons the active pipeline id (requestRecordingCancellation),
+                // so the pipeline's post-transcribe shouldCancel() gate THROWS AWAY the
+                // already-returned 200 text and dismisses the bar; the in-flight upload
+                // (a child of the cancelled Task) is torn down → proxy sees BrokenPipe.
+                //
+                // FIX: a plain toggle press must NOT abort an in-flight transcription.
+                // Transcription is already committed — let it finish and paste. Explicit
+                // cancellation still works via the Esc / close-button path
+                // (handleDismissRecorderPanelNotification + onCloseTapped → cancelRecording),
+                // which is the ONLY intended canceller once transcription has begun.
+                // ───────────────────────────────────────────────────────────────
+                vippLog.info("toggleRecorderPanel: IGNORING re-entrant toggle during \(String(describing: engine.recordingState), privacy: .public) (guard — do NOT cancel in-flight transcription)")
+                return
             case .idle:
                 if engine.assistantSession.canSendFollowUp {
                     SoundManager.shared.playStartSound()
@@ -191,6 +228,12 @@ class RecorderUIManager: ObservableObject, RecorderPanelPresenting {
     func dismissRecorderPanel() async {
         guard let engine = engine else { return }
 
+        // VIPPDebug: this is the recorder-bar HIDE site. Logging state here tells us
+        // WHY the bar vanished — if state is .transcribing/.enhancing at hide time,
+        // a transcription was killed mid-flight (the bug); if .idle, it's a normal
+        // post-delivery dismiss.
+        vippLog.info("dismissRecorderPanel: HIDE bar (state=\(String(describing: engine.recordingState), privacy: .public))")
+
         hideRecorderPanel()
         isRecorderPanelVisible = false
         engine.assistantSession.reset()
@@ -207,6 +250,11 @@ class RecorderUIManager: ObservableObject, RecorderPanelPresenting {
 
     func cancelRecording() async {
         guard let engine = engine else { return }
+        // VIPPDebug: explicit cancel site. After Fix above, this should ONLY fire for a
+        // genuine user cancel (Esc / close button) or pre-transcription states — NOT
+        // from a stray toggle during .transcribing. If you see this while state is
+        // .transcribing/.enhancing on a NORMAL dictation, an unintended caller leaked in.
+        vippLog.info("cancelRecording: CANCEL requested (state=\(String(describing: engine.recordingState), privacy: .public))")
         await engine.cancelRecording()
         await dismissRecorderPanel()
     }
@@ -236,6 +284,10 @@ class RecorderUIManager: ObservableObject, RecorderPanelPresenting {
 
     @objc public func handleDismissRecorderPanelNotification() {
         Task {
+            // VIPPDebug: explicit dismiss (Esc / DismissMiniRecorderIntent). This IS the
+            // intended cancel path for an in-flight transcription, so cancelling here is
+            // correct (unlike the re-entrant toggle path, which we now ignore).
+            vippLog.info("handleDismissRecorderPanelNotification: explicit dismiss (state=\(String(describing: self.engine?.recordingState), privacy: .public))")
             switch engine?.recordingState {
             case .starting, .recording, .transcribing, .enhancing:
                 await cancelRecording()

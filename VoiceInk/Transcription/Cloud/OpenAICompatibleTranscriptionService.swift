@@ -1,6 +1,14 @@
 import Foundation
+import os
 
 class OpenAICompatibleTranscriptionService {
+    // VIPPDebug: client-side view of the local Deepgram proxy round-trip. Pairs with the
+    // proxy's own 200/500-BrokenPipe log so we can tell, from the APP side, whether an
+    // upload completed (200), failed, or was CANCELLED mid-flight (URLError.cancelled →
+    // the BrokenPipe the proxy sees). Filter:
+    //   log stream --predicate 'subsystem == "com.ethansk.VoiceInkPlusPlus" && category == "VIPPDebug"'
+    private let vippLog = Logger(subsystem: "com.ethansk.VoiceInkPlusPlus", category: "VIPPDebug")
+
     // Dedicated URLSession with EXTENDED timeouts instead of URLSession.shared.
     // WHY: URLSession.shared uses the default 60s request timeout. OpenAI-compatible
     // proxies (esp. ones doing their own upstream retries) can hold a multipart audio
@@ -27,11 +35,28 @@ class OpenAICompatibleTranscriptionService {
         request.setValue("Bearer \(model.apiKey)", forHTTPHeaderField: "Authorization")
 
         let body = try buildRequestBody(audioURL: audioURL, modelName: model.modelName, boundary: boundary, context: context)
-        let (data, response) = try await urlSession.upload(for: request, from: body)
+        vippLog.info("cloud upload START endpoint=\(model.apiEndpoint, privacy: .public) bytes=\(body.count, privacy: .public)")
+
+        let data: Data
+        let response: URLResponse
+        do {
+            (data, response) = try await urlSession.upload(for: request, from: body)
+        } catch {
+            // VIPPDebug: an error here with URLError.cancelled is the BrokenPipe-500 case:
+            // the enclosing Task (key-event / pipeline) was cancelled, so URLSession aborts
+            // the upload and the proxy sees the client close the socket. Any other error is
+            // a genuine network failure / timeout. Re-throw unchanged.
+            let isCancelled = (error as? URLError)?.code == .cancelled
+            vippLog.error("cloud upload THREW isCancelled=\(isCancelled, privacy: .public) error=\(error.localizedDescription, privacy: .public)")
+            throw error
+        }
 
         guard let httpResponse = response as? HTTPURLResponse else {
+            vippLog.error("cloud upload END non-HTTP response")
             throw CloudTranscriptionError.networkError(URLError(.badServerResponse))
         }
+
+        vippLog.info("cloud upload END status=\(httpResponse.statusCode, privacy: .public) bytes=\(data.count, privacy: .public)")
 
         if !(200...299).contains(httpResponse.statusCode) {
             let errorMessage = String(data: data, encoding: .utf8) ?? "No error message"

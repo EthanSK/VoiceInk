@@ -46,6 +46,10 @@ class VoiceInkEngine: NSObject, ObservableObject {
     private let pipeline: TranscriptionPipeline
 
     let logger = Logger(subsystem: "com.prakashjoshipax.voiceink", category: "VoiceInkEngine")
+    // VIPPDebug: see RecorderUIManager for the filter predicate. Tracks the stop→
+    // transcribe state transition and every cancellation request so we can attribute
+    // who/when poisons an in-flight pipeline.
+    let vippLog = Logger(subsystem: "com.ethansk.VoiceInkPlusPlus", category: "VIPPDebug")
 
     init(
         modelContext: ModelContext,
@@ -110,6 +114,10 @@ class VoiceInkEngine: NSObject, ObservableObject {
         }
 
         if recordingState == .recording {
+            // VIPPDebug: this is record STOP (key-up / toggle-off). State flips to
+            // .transcribing here and the pipeline is awaited inline below — the window
+            // during which a stray re-entrant event could try to cancel us.
+            vippLog.info("toggleRecord: STOP → state .recording→.transcribing (shouldCancel=\(self.shouldCancelRecording, privacy: .public))")
             activePipelineUseCase = activeRecordingUseCase
             activeRecordingUseCase = .newSession
             activeRecordingStartID = nil
@@ -499,10 +507,18 @@ class VoiceInkEngine: NSObject, ObservableObject {
     }
 
     private func requestRecordingCancellation() {
+        // VIPPDebug: THE poison point. If this fires while state==.transcribing/.enhancing
+        // it inserts the active pipeline id into canceledPipelineTranscriptionIDs, which
+        // makes the pipeline's shouldCancel() gate discard a finished transcription. On a
+        // NORMAL dictation this should NOT fire during .transcribing (the RecorderUIManager
+        // re-entrancy guard prevents the stray-toggle path). Seeing it here for a normal
+        // dictation means an unintended caller (Esc? interruption? second event?) leaked in.
+        vippLog.info("requestRecordingCancellation: state=\(String(describing: self.recordingState), privacy: .public) activePipelineID=\(self.activePipelineTranscriptionID?.uuidString ?? "nil", privacy: .public) → setting shouldCancelRecording=true")
         shouldCancelRecording = true
 
         if (recordingState == .transcribing || recordingState == .enhancing),
            let activePipelineTranscriptionID {
+            vippLog.info("requestRecordingCancellation: POISONING pipeline id \(activePipelineTranscriptionID.uuidString, privacy: .public) (finished transcription may be discarded)")
             canceledPipelineTranscriptionIDs.insert(activePipelineTranscriptionID)
         }
 

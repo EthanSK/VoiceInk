@@ -53,6 +53,10 @@ final class FocusLockService: ObservableObject {
     static let shared = FocusLockService()
 
     private let logger = Logger(subsystem: "com.prakashjoshipax.voiceink", category: "FocusLock")
+    // VIPPDebug: see RecorderUIManager for the filter predicate. Surfaces which restore
+    // branch runs at delivery (no lock / same-app no-op / real cross-app restore) so we
+    // can confirm Feature A is NOT touching focus on a normal dictation.
+    private let vippLog = Logger(subsystem: "com.ethansk.VoiceInkPlusPlus", category: "VIPPDebug")
 
     // TUNABLE: how long the record hotkey must be HELD (from key-down) before we
     // treat the press as a "long press" and arm the focus lock. 450ms is long
@@ -201,7 +205,10 @@ final class FocusLockService: ObservableObject {
         // then goes to the live frontmost field exactly like upstream. This early
         // return is the load-bearing guarantee that Feature A can't affect the
         // non-locked paste path; do not move any focus-touching code above it.
-        guard isLockActive, let target = lockedTarget else { return false }
+        guard isLockActive, let target = lockedTarget else {
+            vippLog.info("restoreFocusToLock: no lock active → no-op (normal frontmost paste)")
+            return false
+        }
 
         guard AXIsProcessTrusted() else {
             // Permission was revoked mid-session. Can't restore — fall back to
@@ -259,8 +266,10 @@ final class FocusLockService: ObservableObject {
             // Same app still frontmost => user never left it. Touch nothing; let the
             // normal paste path drop the transcript into whatever field is live now.
             logger.notice("restoreFocusToLock: same app frontmost — no-op, normal paste")
+            vippLog.info("restoreFocusToLock: lock armed BUT same app frontmost (pid=\(target.pid, privacy: .public)) → no-op, normal paste")
             return true
         }
+        vippLog.info("restoreFocusToLock: lock armed, DIFFERENT app frontmost (front=\(frontmostApp?.processIdentifier ?? -1, privacy: .public) target=\(target.pid, privacy: .public)) → performing real restore")
 
         // From here, focus HAS genuinely moved to a DIFFERENT app (different frontmost
         // pid): this is the real long-press → switch-to-another-app case the lock
