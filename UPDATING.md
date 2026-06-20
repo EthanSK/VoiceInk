@@ -2,9 +2,9 @@
 
 This is Ethan's personal GPL-3.0 fork of [Beingpax/VoiceInk](https://github.com/Beingpax/VoiceInk),
 carrying a small set of local patches on top of upstream. Upstream **does not accept PRs**, so our
-patches live only here and must be **rebased** onto each upstream release.
+patches live only here and must be **merged** with each upstream release.
 
-## Our patches (preserve these through every rebase)
+## Our patches (preserve these through every merge)
 
 All in `VoiceInk/Modes/ActiveWindowService.swift` + a one-line wiring call in `VoiceInk/VoiceInk.swift`:
 
@@ -81,25 +81,27 @@ Mini to match `com.ethansk.VoiceInkPlusPlus`, and point any app-path references 
 fresh TCC grants (Mic / Accessibility / Screen Recording) because it's a brand-new identity to macOS —
 this is expected and is the whole point of the split.
 
-## Pull in upstream changes (rebase workflow)
+## Pull in upstream changes (merge workflow)
 
 ```sh
-git fetch upstream
-git rebase upstream/main          # replay our 2 commits onto the latest upstream
-# If conflicts: they'll be in ActiveWindowService.swift / VoiceInk.swift — keep BOTH upstream's
-# changes and our observer/start() additions, then `git rebase --continue`.
-git push --force-with-lease origin main
+git checkout main
+git fetch origin upstream
+git reset --hard origin/main       # origin/main is the source of truth for the fork
+git merge --no-edit upstream/main # preserve fork history; do not rebase origin/main
+# If conflicts: they'll likely be in ActiveWindowService.swift / VoiceInk.swift — keep BOTH
+# upstream's changes and our observer/start() additions, then commit the resolved merge.
+git push origin main
 ```
 Then rebuild on the Mini (`make local`) and install the fresh `~/Downloads/VoiceInkPlusPlus.app` on the MBP.
 
-Upstream auto-update (Sparkle) is disabled in local builds, so updating is this manual rebase + Mini
+Upstream auto-update (Sparkle) is disabled in local builds, so updating is this manual merge + Mini
 rebuild — or the automated job below.
 
 ## Automated rebuild (keeps the build current with our fixes)
 
-A scheduled job on the Mini (`~/.claude/scripts/voiceink-fork-autorebuild.sh` + a LaunchAgent) does the
-above on a cadence: fetch upstream → rebase our patches → `make local` → notify, and the new `.app` is
-copied to the MBP. If a rebase hits a conflict it stops and notifies (manual resolve) rather than
+A scheduled job on the Mini (`~/.claude/scripts/voiceink-fork-update.sh` + a LaunchAgent) does the
+above on a cadence: fetch upstream → merge upstream/main into the fork → `make local` → notify, and the new `.app` is
+copied to the MBP. If a merge hits a conflict it stops and notifies (manual resolve) rather than
 producing a broken build. See that script for details.
 
 ## Settings / data
