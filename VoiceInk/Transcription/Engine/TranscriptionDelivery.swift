@@ -28,7 +28,7 @@ final class TranscriptionDelivery {
     }
 
     func deliver(_ request: Request, actions: Actions) async {
-        vippLog.info("deliver: enter status=\(request.transcription.transcriptionStatus, privacy: .public) outputMode=\(String(describing: request.output.outputMode), privacy: .public) textChars=\(request.text?.count ?? -1, privacy: .public) followUp=\(request.isAssistantFollowUp, privacy: .public)")
+        vippLog.info("deliver: enter status=\(request.transcription.transcriptionStatus ?? "nil", privacy: .public) outputMode=\(String(describing: request.output.outputMode), privacy: .public) textChars=\(request.text?.count ?? -1, privacy: .public) followUp=\(request.isAssistantFollowUp, privacy: .public)")
         // Feature A (focus lock): ONLY the paste path consumes a focus lock. Every
         // other delivery outcome below (incomplete transcription, assistant
         // follow-up, respond mode, custom command, or empty text) must release any
