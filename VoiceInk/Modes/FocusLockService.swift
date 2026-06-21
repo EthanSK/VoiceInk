@@ -94,6 +94,44 @@ final class FocusLockService: ObservableObject {
         stopHoldDecisionPending = pending
     }
 
+    // MARK: - Live modifier-state check (modifier-only STOP-hold support, 2026-06-21)
+    //
+    // WHY THIS EXISTS — the modifier-only ~0.1s key-up problem:
+    // Ethan's record shortcut is MODIFIER-ONLY (⇧⌃⌥, toggle mode). For a modifier-only
+    // shortcut the OS reports the shortcut's "key-up" almost IMMEDIATELY (~0.1s) on the
+    // STOP press, no matter how long he physically keeps the keys held down. (There is
+    // no real keyDown/keyUp for a bare modifier combo — the monitor synthesises a
+    // release as soon as the combo is recognised.) That spurious early key-up used to
+    // take the "short-tap" branch and CANCEL the stop-hold threshold timer before it
+    // could reach longPressThreshold (0.45s) — so the lock NEVER engaged, and every stop
+    // logged as `STOP short-tap (dur≈0.10) → no lock`.
+    //
+    // THE FIX: for a modifier-only shortcut we IGNORE that flaky key-up entirely for the
+    // lock decision and instead let the threshold timer fire, then ask the HARDWARE: are
+    // the required modifier keys STILL physically held right now? `NSEvent.modifierFlags`
+    // is a live global snapshot of the physical modifier state, independent of our
+    // monitor's synthetic key-up. If the required modifiers are still down at the
+    // threshold, it was a genuine long-hold → lock. If they've been released, it was a
+    // real quick tap → no lock.
+    //
+    // `required` is the modifier mask of the active record shortcut (for Ethan: ⇧⌃⌥),
+    // read from the Shortcut definition so we don't hardcode the combo. We compare with
+    // `isSuperset` (not `==`) so the live flags only need to CONTAIN the required combo —
+    // extra modifiers Ethan happens to be touching don't break the "still held" verdict.
+    // Returns true ⇒ still held ⇒ genuine long-hold; false ⇒ released ⇒ tap.
+    func requiredModifiersStillHeld(required: NSEvent.ModifierFlags) -> Bool {
+        // Normalise to the shortcut-relevant modifier bits only (⌃⌥⇧⌘Fn) so stray
+        // device-specific flags (caps-lock, numeric-pad, etc.) can't skew the compare.
+        let relevant: NSEvent.ModifierFlags = [.control, .option, .shift, .command, .function]
+        let live = NSEvent.modifierFlags.intersection(relevant)
+        let want = required.intersection(relevant)
+        // Empty required mask should never reach here (a modifier-only shortcut always
+        // has ≥1 modifier), but treat "nothing required" as "not held" to be safe — we
+        // don't want to lock on an undefined requirement.
+        guard !want.isEmpty else { return false }
+        return live.isSuperset(of: want)
+    }
+
     private init() {}
 
     // True while a long-press lock is committed. ActiveWindowService reads this to

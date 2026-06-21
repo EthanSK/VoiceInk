@@ -130,6 +130,19 @@ class RecordingShortcutManager: ObservableObject {
             },
             cancelRecording: {
                 await recorderUIManager.cancelRecording()
+            },
+            // Feature A (2026-06-21): lets the handler look up the ACTIVE Shortcut for a
+            // given action so it can tell whether the shortcut is MODIFIER-ONLY (⇧⌃⌥) and
+            // read its required modifier mask. The handler needs this to robustly decide a
+            // STOP-hold focus-lock for modifier-only shortcuts, whose key-up fires at
+            // ~0.1s and can't be timed (see RecordingShortcutModeHandler for the full why).
+            shortcutForAction: { action in
+                switch action {
+                case .primaryRecording, .secondaryRecording:
+                    return ShortcutStore.shortcut(for: action)
+                default:
+                    return nil
+                }
             }
         )
 
@@ -347,6 +360,9 @@ final class RecordingShortcutModeHandler {
     private let recordingState: @MainActor () -> RecordingState
     private let toggleRecorderPanel: @MainActor (UUID?) async -> Void
     private let cancelRecording: @MainActor () async -> Void
+    // Feature A (2026-06-21): resolve the active Shortcut for an action so we can read
+    // whether it's modifier-only + its required modifier mask. See the STOP-hold logic.
+    private let shortcutForAction: @MainActor (ShortcutAction) -> Shortcut?
 
     // VIPPDebug: VoiceInk++-only diagnostic logger (NOT the base voiceink logger).
     // Surfaces the press lifecycle — key-down capture, long-press timer arm/fire,
@@ -368,6 +384,18 @@ final class RecordingShortcutModeHandler {
     //   • STOP  key-up  → resolve short-tap (clearCandidate) vs long-hold (keep; the
     //                     stop-hold timer already promoted it).
     private var currentPressStartedRecording = false
+
+    // Feature A (modifier-only STOP-hold, 2026-06-21): captured at the STOP key-down so
+    // the threshold timer + the key-up handler know how to resolve the gesture.
+    //   • currentStopIsModifierOnly: is the active record shortcut modifier-only (⇧⌃⌥)?
+    //     If so, the ~0.1s spurious key-up must NOT cancel the timer or decide the
+    //     gesture — the timer decides by LIVE modifier state instead.
+    //   • currentStopRequiredModifiers: the required modifier mask of that shortcut, read
+    //     from its Shortcut definition (so we don't hardcode ⇧⌃⌥). Used at threshold to
+    //     ask NSEvent.modifierFlags "are these still physically held?".
+    private var currentStopIsModifierOnly = false
+    private var currentStopRequiredModifiers: NSEvent.ModifierFlags = []
+
     private var interruptedRecordingActions = Set<ShortcutAction>()
     private var activeShortcutCanCancelAccidentalStart = false
     private var lastShortcutPressTime: Date?
@@ -408,13 +436,15 @@ final class RecordingShortcutModeHandler {
         isRecorderVisible: @escaping @MainActor () -> Bool,
         recordingState: @escaping @MainActor () -> RecordingState,
         toggleRecorderPanel: @escaping @MainActor (UUID?) async -> Void,
-        cancelRecording: @escaping @MainActor () async -> Void
+        cancelRecording: @escaping @MainActor () async -> Void,
+        shortcutForAction: @escaping @MainActor (ShortcutAction) -> Shortcut?
     ) {
         self.canHandleShortcutAction = canHandleShortcutAction
         self.isRecorderVisible = isRecorderVisible
         self.recordingState = recordingState
         self.toggleRecorderPanel = toggleRecorderPanel
         self.cancelRecording = cancelRecording
+        self.shortcutForAction = shortcutForAction
     }
 
     func reset() {
@@ -425,6 +455,8 @@ final class RecordingShortcutModeHandler {
         interruptedRecordingActions.removeAll()
         activeShortcutCanCancelAccidentalStart = false
         currentPressStartedRecording = false
+        currentStopIsModifierOnly = false
+        currentStopRequiredModifiers = []
 
         // Feature A (focus lock): a full reset (monitor restart, accidental-start
         // cancel) must tear down any pending stop-hold timer AND any captured/locked
@@ -467,6 +499,10 @@ final class RecordingShortcutModeHandler {
         let startsFreshRecording = !isRecorderVisible() && !isHandsFreeRecording
         // Remember which side this press is, for the matching key-up resolution.
         currentPressStartedRecording = startsFreshRecording
+        // Clear the STOP-side modifier-only flags up-front so a prior STOP's values can
+        // never leak into a fresh START press; the STOP branch recomputes them below.
+        currentStopIsModifierOnly = false
+        currentStopRequiredModifiers = []
         if startsFreshRecording {
             // START PRESS (new model): ALWAYS snapshot the currently-focused field and
             // KEEP it alive for the whole recording. This is the only instant the
@@ -499,47 +535,104 @@ final class RecordingShortcutModeHandler {
             // delivery to the field captured back at the START press. Because
             // transcription takes ~1–2s and the paste waits for it, this timer normally
             // fires BEFORE delivery, so the lock flag is set in time for
-            // restoreFocusToLock(). A quick tap-to-stop releases before the threshold →
-            // handleKeyUp cancels this timer and calls clearCandidate() (no lock).
+            // restoreFocusToLock().
+            //
+            // ── THE MODIFIER-ONLY ~0.1s KEY-UP PROBLEM (2026-06-21 fix) ──────────────
+            // Ethan's shortcut is MODIFIER-ONLY (⇧⌃⌥, toggle mode). For a bare modifier
+            // combo there is no real key press — the monitor synthesises a "key-up"
+            // almost IMMEDIATELY (~0.1s) regardless of how long he physically keeps the
+            // keys down. Under the old code that spurious early key-up always took the
+            // "short-tap" branch in handleKeyUp and CANCELLED this timer before it could
+            // reach 0.45s — so the lock NEVER engaged. Every stop logged as
+            // `STOP short-tap (dur≈0.10) → no lock`.
+            //
+            // FIX: capture whether the active shortcut is modifier-only + its required
+            // modifier mask NOW (at STOP key-down). If it IS modifier-only, the key-up
+            // handler will NOT cancel this timer or decide the gesture — instead the
+            // timer is allowed to fire at the threshold and decides by LIVE PHYSICAL
+            // MODIFIER STATE (NSEvent.modifierFlags): required modifiers still held ⇒
+            // genuine long-hold ⇒ lock; released ⇒ real tap ⇒ no lock. For a normal
+            // KEY shortcut the OS key-up IS reliable, so we keep the old timing path
+            // (key-up cancels the timer for a sub-threshold tap) — the same timer just
+            // additionally re-checks live modifier state when it fires, which is correct
+            // either way.
             //
             // Mirrors the OLD start-side promote-timer pattern: [weak self] + the
             // isShortcutPressed / activeRecordingShortcutAction race guards so a key-up
-            // that lands exactly as the timer fires can't promote a released press.
-            //
-            // NOTE: we only arm if a candidate actually exists (i.e. the START press
-            // successfully captured a focused field). If there's nothing to lock,
-            // promoteToLock() is a documented no-op anyway, so arming is harmless, but
-            // we still arm unconditionally for simplicity — the no-op covers it.
+            // that lands exactly as the timer fires can't promote a released press
+            // (these guards apply to the KEY-shortcut path; for modifier-only we
+            // deliberately don't rely on isShortcutPressed since the synthetic key-up
+            // already cleared it — see below).
             longPressLockTask?.cancel()
+
+            // Resolve the active shortcut so we know how to interpret the upcoming
+            // key-up. shortcutForAction reads the live Shortcut definition from storage.
+            let activeShortcut = shortcutForAction(action)
+            currentStopIsModifierOnly = activeShortcut?.isModifierOnly ?? false
+            // Required modifier mask for the live-state check (for Ethan: ⇧⌃⌥). Falls
+            // back to empty if we can't resolve the shortcut — the live-state check then
+            // safely refuses to lock (requiredModifiersStillHeld returns false on empty).
+            currentStopRequiredModifiers = activeShortcut?.modifierFlags ?? []
+            // Snapshot for the timer closure (avoid capturing self.* mutable state).
+            let isModifierOnly = currentStopIsModifierOnly
+            let requiredModifiers = currentStopRequiredModifiers
+
             // Mark the stop-hold decision as PENDING so delivery's paste() can do a
             // tiny grace-wait if transcription somehow finishes before this resolves.
             FocusLockService.shared.setStopHoldDecisionPending(true)
             // VIPPDebug: STOP press key-down — recording is stopping NOW; arm the
-            // stop-hold timer. If it FIRES we long-hold-locked; if it's cancelled at
-            // key-up first, it was a short tap.
-            vippLog.info("shortcut: STOP press key-down → arming stop-hold timer (threshold=\(FocusLockService.longPressThreshold) action=\(String(describing: action), privacy: .public))")
+            // stop-hold timer. modifierOnly flags whether we'll decide by live modifier
+            // state (true) or by key-up timing (false).
+            vippLog.info("shortcut: STOP press key-down → arming stop-hold timer (threshold=\(FocusLockService.longPressThreshold) modifierOnly=\(isModifierOnly) action=\(String(describing: action), privacy: .public))")
             longPressLockTask = Task { @MainActor [weak self] in
                 let thresholdNanos = UInt64(FocusLockService.longPressThreshold * 1_000_000_000)
                 try? await Task.sleep(nanoseconds: thresholdNanos)
                 guard let self, !Task.isCancelled else {
-                    // Cancelled before firing (short tap key-up). The key-up path
-                    // resolves the decision + clears the pending flag; nothing to do.
+                    // Cancelled before firing. For a KEY shortcut this means a real
+                    // sub-threshold tap (key-up cancelled us) — nothing to do. For a
+                    // modifier-only shortcut the key-up does NOT cancel us, so reaching
+                    // here-cancelled would only happen on reset/teardown; also fine.
                     return
                 }
-                // Re-check the combo is genuinely STILL down for THIS action — guards
-                // against a race where the stop key-up landed just as the timer fired.
+
+                if isModifierOnly {
+                    // MODIFIER-ONLY PATH: the synthetic ~0.1s key-up already cleared
+                    // isShortcutPressed, so we CANNOT use it as a "still held" proxy.
+                    // Ask the hardware directly: are the required modifiers (⇧⌃⌥) still
+                    // physically down right now?
+                    let stillHeld = FocusLockService.shared.requiredModifiersStillHeld(required: requiredModifiers)
+                    // os_log: required mask + live raw flags + verdict. modifierFlags
+                    // rawValue (UInt) is fine to interpolate directly.
+                    let liveFlags = NSEvent.modifierFlags.rawValue
+                    self.vippLog.info("focuslock: STOP threshold reached → modifiers still held=\(stillHeld) (required=\(requiredModifiers.rawValue), current=\(liveFlags)) → \(stillHeld ? "promoteToLock" : "tap") action=\(String(describing: action), privacy: .public)")
+                    if stillHeld {
+                        // Genuine long-hold → engage the focus lock so delivery restores
+                        // focus to the field captured at the START press.
+                        FocusLockService.shared.promoteToLock()
+                    } else {
+                        // Real quick tap (modifiers released before threshold) → no lock;
+                        // discard the persisted candidate so delivery uses normal paste.
+                        FocusLockService.shared.clearCandidate()
+                    }
+                    // Decision resolved either way — clear the pending flag so delivery's
+                    // grace-wait (if any) proceeds immediately.
+                    FocusLockService.shared.setStopHoldDecisionPending(false)
+                    return
+                }
+
+                // KEY-SHORTCUT PATH (reliable key-up): if we got here the key-up never
+                // cancelled us, i.e. the key is genuinely still held past the threshold.
+                // Re-check the combo is still down for THIS action to guard a key-up
+                // landing exactly as the timer fires.
                 guard self.isShortcutPressed,
                       self.activeRecordingShortcutAction == action else {
                     // Released right at the boundary — let the key-up path resolve it.
                     return
                 }
-                // VIPPDebug: stop-hold timer SURVIVED to fire — combo held past
-                // threshold at STOP, so promote the persisted start-candidate to a lock.
-                // Delivery's restoreFocusToLock() will then paste into the original field.
+                // VIPPDebug: stop-hold timer SURVIVED to fire — key held past threshold
+                // at STOP, so promote the persisted start-candidate to a lock.
                 self.vippLog.info("focuslock: STOP long-hold ≥threshold → promoteToLock (paste into original field) action=\(String(describing: action), privacy: .public)")
                 FocusLockService.shared.promoteToLock()
-                // Decision resolved (locked): clear the pending flag so delivery's
-                // grace-wait (if any) proceeds immediately.
                 FocusLockService.shared.setStopHoldDecisionPending(false)
             }
         }
@@ -595,8 +688,20 @@ final class RecordingShortcutModeHandler {
         if currentPressStartedRecording {
             // START key-up — leave focus state untouched; candidate persists.
             // (No VIPPDebug noise here; the RECORD START line already logged capture.)
+        } else if currentStopIsModifierOnly {
+            // ── MODIFIER-ONLY STOP key-up (2026-06-21 fix) ─────────────────────────
+            // This key-up is the SPURIOUS ~0.1s synthetic release that the OS emits for
+            // a bare modifier combo regardless of how long Ethan physically holds the
+            // keys. We must therefore IGNORE it entirely for the lock decision: do NOT
+            // cancel the stop-hold timer, do NOT take any short-tap/long-hold branch.
+            // The timer (armed at STOP key-down) will fire at longPressThreshold and
+            // decide by LIVE NSEvent.modifierFlags whether the required modifiers (⇧⌃⌥)
+            // are still physically held — that is the only reliable signal for this
+            // shortcut kind. Leaving the timer alive here is the whole fix.
+            vippLog.info("shortcut: STOP key-up (modifier-only) dur=\(shortcutPressStartTime.map { eventTime - $0 } ?? 0) → IGNORED for lock decision (live-modifier timer will decide)")
         } else {
-            // STOP key-up — cancel the stop-hold timer, then resolve the gesture.
+            // STOP key-up (KEY shortcut, reliable key-up) — cancel the stop-hold timer,
+            // then resolve the gesture by press duration.
             longPressLockTask?.cancel()
             longPressLockTask = nil
             if let pressStart = shortcutPressStartTime {

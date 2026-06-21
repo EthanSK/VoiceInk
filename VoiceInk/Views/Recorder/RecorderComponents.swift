@@ -355,17 +355,31 @@ struct FocusLockIndicator: View {
     var body: some View {
         Group {
             if focusLock.isLockActive {
-                // Subtle footnote-weight caption. Secondary white opacity + small
-                // size so it sits quietly above the waveform without competing with
-                // it, but stays legible on the recorder's black background. The
-                // exact string is intentional — do not reword.
-                Text("Using input from voice start")
-                    .font(.system(size: 10, weight: .medium))
-                    .foregroundColor(.white.opacity(0.55))
-                    .lineLimit(1)
-                    .minimumScaleFactor(0.7)
-                    .transition(.opacity)
-                    .accessibilityLabel(Text("Using input from voice start"))
+                // VIPP (2026-06-21): made the indicator VISIBLY DISTINCT for the new
+                // STOP-hold focus-lock path. Ethan's stop-hold gesture (⇧⌃⌥ held on
+                // stop) is subtle and easy to second-guess, so he asked for a clear
+                // at-a-glance signal that the long-hold registered and the special
+                // "lock to start field" mode is engaged. We now prepend a LOCK GLYPH
+                // ("lock.fill") to the caption + tint the whole row a warm accent so it
+                // pops against the recorder's black background — not just the quiet grey
+                // footnote it was before. The lock engages the instant promoteToLock()
+                // flips isLockActive (whether via the STOP-hold timer or the START-hold
+                // path) and clears the moment clearLock() flips it false at delivery/end.
+                HStack(spacing: 4) {
+                    // Lock glyph — the unmistakable "you are in locked mode" cue.
+                    Image(systemName: "lock.fill")
+                        .font(.system(size: 9, weight: .bold))
+                    // Caption. The exact string is intentional — do not reword.
+                    Text("Using input from voice start")
+                        .font(.system(size: 10, weight: .semibold))
+                        .lineLimit(1)
+                        .minimumScaleFactor(0.7)
+                }
+                // Warm amber accent so the locked state reads as a distinct, deliberate
+                // mode at a glance (vs the neutral grey of a normal recording's UI).
+                .foregroundColor(Color(red: 1.0, green: 0.78, blue: 0.35))
+                .transition(.opacity)
+                .accessibilityLabel(Text("Locked: using input from voice start"))
             }
         }
         .animation(.easeInOut(duration: 0.2), value: focusLock.isLockActive)
