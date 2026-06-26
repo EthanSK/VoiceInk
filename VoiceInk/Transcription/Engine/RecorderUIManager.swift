@@ -101,6 +101,15 @@ class RecorderUIManager: ObservableObject, RecorderPanelPresenting {
                             await self?.dismissRecorderPanel()
                         }
                     },
+                    // Cancel ("X") button → discard the active recording/transcription
+                    // with NO paste, then resume any paused media. cancelRecording()
+                    // is the existing clean teardown path (engine.cancelRecording →
+                    // recorder.stopRecording → resumeMedia) followed by dismiss.
+                    onCancelTapped: { [weak self] in
+                        Task { @MainActor in
+                            await self?.cancelRecording()
+                        }
+                    },
                     onAssistantFollowUp: { [weak engine] text in
                         Task { @MainActor in
                             await engine?.sendAssistantFollowUp(text)
@@ -123,6 +132,14 @@ class RecorderUIManager: ObservableObject, RecorderPanelPresenting {
                     onCloseTapped: { [weak self] in
                         Task { @MainActor in
                             await self?.dismissRecorderPanel()
+                        }
+                    },
+                    // Cancel ("X") button → discard the active recording/transcription
+                    // with NO paste, then resume any paused media. Same clean teardown
+                    // path as the notch panel above.
+                    onCancelTapped: { [weak self] in
+                        Task { @MainActor in
+                            await self?.cancelRecording()
                         }
                     },
                     onAssistantFollowUp: { [weak engine] text in

@@ -14,6 +14,9 @@ class NotchWindowManager {
         assistantSession: AssistantSession,
         onRecordButtonTapped: @escaping () -> Void,
         onCloseTapped: @escaping () -> Void,
+        // onCancelTapped: fired by the red "X" → discard the recording/transcription
+        // (no paste) and resume paused media. Routed to RecorderUIManager.cancelRecording().
+        onCancelTapped: @escaping () -> Void,
         onAssistantFollowUp: @escaping (String) -> Void
     ) {
         self.makeView = {
@@ -24,6 +27,7 @@ class NotchWindowManager {
                     assistantSession: assistantSession,
                     onRecordButtonTapped: onRecordButtonTapped,
                     onCloseTapped: onCloseTapped,
+                    onCancelTapped: onCancelTapped,
                     onAssistantFollowUp: onAssistantFollowUp
                 )
             )
