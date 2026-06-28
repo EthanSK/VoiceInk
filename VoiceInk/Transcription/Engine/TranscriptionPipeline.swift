@@ -61,6 +61,17 @@ class TranscriptionPipeline {
         enhancementConfiguration: @escaping () -> EnhancementRuntimeConfiguration?,
         recordingContextSnapshot: @escaping () async -> RecordingContextSnapshot? = { nil },
         outputConfiguration: @escaping () -> OutputRuntimeConfiguration,
+        // ── VIPP (skip-mode-processing feature) — EXPLICIT bypass flag ──
+        // Resolved at pipeline-run time from the owning RecordingSession's one-shot
+        // `skipPostProcessing`. We thread it as a plain Bool (NOT only via the
+        // outputConfiguration closure rewrite) so the bypass is DETERMINISTIC and does
+        // not depend on the closure-rewrite reaching delivery intact. When true: AI
+        // enhancement is skipped AND TranscriptionDelivery is FORCED down the raw-paste
+        // branch (deliverCustomCommand / deliverResponse are never taken). This is the
+        // load-bearing guarantee for the "skip script" button — see the matching
+        // short-circuit in TranscriptionDelivery.deliver and the resolve site in
+        // VoiceInkEngine.runPipeline.
+        skipPostProcessing: @escaping () -> Bool = { false },
         onStateChange: @escaping (RecordingState) -> Void,
         shouldCancel: () -> Bool,
         onCancel: @escaping () async -> Void,
@@ -73,6 +84,19 @@ class TranscriptionPipeline {
         var responseError: String?
         var outputForDelivery: OutputRuntimeConfiguration?
         var responseConfig: EnhancementRuntimeConfiguration?
+
+        // ── VIPP (skip-mode-processing feature) — resolve the one-shot bypass ONCE ──
+        // Read the owning session's flag at pipeline-run time (after STOP) so toggling
+        // the button any time before this is honored. We capture it into a local Bool and
+        // use it as the AUTHORITATIVE gate for both bypass points below, instead of relying
+        // solely on the enhancement/output closures' internal checks. This is the fix for
+        // "the script still runs when skip is engaged": even if the outputConfiguration
+        // closure's rewrite were ever lost downstream, this explicit flag forces the
+        // raw-paste branch at delivery.
+        let skipPostProcessingNow = skipPostProcessing()
+        if skipPostProcessingNow {
+            vippLog.info("pipeline: skipPostProcessing RESOLVED=true → will bypass enhancement + force raw .paste (no mode script/respond)")
+        }
 
         func finishCanceledTranscription() async {
             await onCancel()
@@ -140,7 +164,14 @@ class TranscriptionPipeline {
 
             text = text.trimmingCharacters(in: .whitespacesAndNewlines)
 
+            // ── VIPP (skip-mode-processing feature) — trigger-word bypass ──
+            // Trigger-word mode-selection can REWRITE the text (strip the trigger word) and
+            // SWITCH the active mode as a side effect (selectTriggerWordModeIfNeeded). For a
+            // one-shot RAW transcript the user explicitly wants NEITHER — no mode switching,
+            // no text mutation. So skip it entirely when the bypass is on. (Codex review
+            // finding #2: skip must also avoid the pre-delivery text/mode mutations.)
             if !assistant.isFollowUp,
+               !skipPostProcessingNow,
                let processedText = triggerWordModeSelection(text) {
                 text = processedText
             }
@@ -155,11 +186,18 @@ class TranscriptionPipeline {
                     transcriptionConfiguration.mode
             )
 
-            if formattingConfiguration.isTextFormattingEnabled {
+            // ── VIPP (skip-mode-processing feature) — keep the transcript RAW ──
+            // Paragraph formatting and word-replacement are part of the mode's
+            // post-processing. The one-shot raw bypass should deliver the verbatim
+            // transcription, so skip BOTH when it's engaged. (Codex review finding #2.)
+            // The transcription record still stores exactly what we paste.
+            if !skipPostProcessingNow, formattingConfiguration.isTextFormattingEnabled {
                 text = ParagraphFormatter.format(text)
             }
 
-            text = WordReplacementService.shared.applyReplacements(to: text, using: modelContext)
+            if !skipPostProcessingNow {
+                text = WordReplacementService.shared.applyReplacements(to: text, using: modelContext)
+            }
             let cleanedText = text
 
             let actualDuration = await AudioFileMetadata.duration(for: audioURL)
@@ -173,12 +211,35 @@ class TranscriptionPipeline {
             finalText = cleanedText
 
             if !assistant.isFollowUp {
-                let shouldRespondInRecorder = resolvedOutputConfiguration.outputMode == .respond &&
+                // ── VIPP (skip-mode-processing feature) — BYPASS POINT #2 (script/respond) ──
+                // When the one-shot flag is on, OVERRIDE whatever the mode resolved to with a
+                // plain raw `.paste` (customCommand stripped, autoSendKey preserved). This is
+                // the deterministic guarantee: TranscriptionDelivery routes on
+                // request.output.outputMode, so forcing `.paste` here means deliverCustomCommand
+                // (the Mode's shell script) and deliverResponse (`.respond`) are NEVER reached.
+                // We do it HERE — at the single place that feeds `outputForDelivery` — rather
+                // than depending only on the outputConfiguration closure's rewrite, so the
+                // bypass cannot be silently lost on the way to delivery.
+                let outputForThisDelivery: OutputRuntimeConfiguration
+                if skipPostProcessingNow {
+                    outputForThisDelivery = OutputRuntimeConfiguration(
+                        mode: resolvedOutputConfiguration.mode,
+                        outputMode: .paste,
+                        autoSendKey: resolvedOutputConfiguration.autoSendKey,
+                        customCommand: nil
+                    )
+                    vippLog.info("pipeline: skip ON → output FORCED to raw .paste (was \(String(describing: resolvedOutputConfiguration.outputMode), privacy: .public))")
+                } else {
+                    outputForThisDelivery = resolvedOutputConfiguration
+                }
+
+                let shouldRespondInRecorder = !skipPostProcessingNow &&
+                    outputForThisDelivery.outputMode == .respond &&
                     resolvedEnhancementConfiguration?.isEnabled == true &&
                     resolvedEnhancementConfiguration.map { configuration in
                         enhancementService?.isConfigured(for: configuration) == true
                     } == true
-                outputForDelivery = resolvedOutputConfiguration
+                outputForDelivery = outputForThisDelivery
                 responseConfig = shouldRespondInRecorder ? resolvedEnhancementConfiguration : nil
 
                 let isSkipShortEnhancementEnabled = UserDefaults.standard.bool(forKey: "SkipShortEnhancement")
@@ -188,7 +249,13 @@ class TranscriptionPipeline {
                     isSkipShortEnhancementEnabled &&
                     WordCounter.count(in: text) <= shortEnhancementWordThreshold
 
-                if let enhancementService,
+                // ── VIPP (skip-mode-processing feature) — BYPASS POINT #1 (AI enhancement) ──
+                // Explicit second gate: when skip is on, never enter the enhancement branch,
+                // regardless of what the enhancementConfiguration closure returned. (The closure
+                // already returns nil on skip, but gating here too makes the bypass independent
+                // of that and keeps both bypass points readable in one place.)
+                if !skipPostProcessingNow,
+                   let enhancementService,
                    let resolvedEnhancementConfiguration,
                    resolvedEnhancementConfiguration.isEnabled,
                    enhancementService.isConfigured(for: resolvedEnhancementConfiguration),
@@ -295,7 +362,7 @@ class TranscriptionPipeline {
             }
         }
 
-        vippLog.info("pipeline: about to DELIVER finalChars=\(finalText?.count ?? -1, privacy: .public) outputMode=\(String(describing: outputForDelivery?.outputMode), privacy: .public)")
+        vippLog.info("pipeline: about to DELIVER finalChars=\(finalText?.count ?? -1, privacy: .public) outputMode=\(String(describing: outputForDelivery?.outputMode), privacy: .public) skip=\(skipPostProcessingNow, privacy: .public)")
         await delivery.deliver(
             TranscriptionDelivery.Request(
                 transcription: transcription,
@@ -303,7 +370,11 @@ class TranscriptionPipeline {
                 output: outputForDelivery ?? outputConfiguration(),
                 responseConfig: responseConfig,
                 responseError: responseError,
-                isAssistantFollowUp: assistant.isFollowUp
+                isAssistantFollowUp: assistant.isFollowUp,
+                // VIPP (skip-mode-processing): pass the resolved one-shot flag so delivery
+                // can make the raw-paste guarantee at the routing point itself (belt-and-
+                // braces on top of the already-forced .paste output above).
+                skipPostProcessing: skipPostProcessingNow
             ),
             actions: TranscriptionDelivery.Actions(
                 setState: onStateChange,

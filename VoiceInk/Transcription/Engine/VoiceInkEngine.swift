@@ -588,6 +588,17 @@ class VoiceInkEngine: NSObject, ObservableObject {
                 }
                 return resolved
             },
+            // ── VIPP (skip-mode-processing feature) — AUTHORITATIVE bypass flag ──
+            // Resolve the owning session's one-shot flag at pipeline-run time and hand it to
+            // the pipeline as a plain Bool. This is the LOAD-BEARING signal: the pipeline uses
+            // it to force a raw `.paste` for delivery AND to skip enhancement, independent of
+            // the closures above. Root-cause note for the "script still ran" bug: relying on
+            // the outputConfiguration closure's rewrite alone was fragile; this explicit flag
+            // makes the bypass deterministic from resolve → pipeline → delivery. Read here
+            // (weak session) at run time so a button toggle any time before STOP is honored.
+            skipPostProcessing: { [weak session] in
+                session?.skipPostProcessing == true
+            },
             // Per-session UI state: drive this session's card spinner (.enhancing etc.).
             onStateChange: { [weak self, weak session] state in
                 guard let session else { return }

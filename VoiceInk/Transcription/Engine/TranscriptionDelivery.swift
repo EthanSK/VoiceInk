@@ -17,6 +17,13 @@ final class TranscriptionDelivery {
         let responseConfig: EnhancementRuntimeConfiguration?
         let responseError: String?
         let isAssistantFollowUp: Bool
+        // VIPP (skip-mode-processing feature): when true, THIS delivery must paste the RAW
+        // transcript and run NO mode post-processing — no custom-command/script
+        // (deliverCustomCommand), no `.respond` (deliverResponse). The pipeline already
+        // forces `output.outputMode == .paste` when this is set, but we also branch on this
+        // explicitly in deliver() so the raw-paste guarantee holds even if `output` were
+        // ever wrong. Defaults to false (normal mode processing). One-shot, per-recording.
+        var skipPostProcessing: Bool = false
     }
 
     struct Actions {
@@ -28,7 +35,40 @@ final class TranscriptionDelivery {
     }
 
     func deliver(_ request: Request, actions: Actions) async {
-        vippLog.info("deliver: enter status=\(request.transcription.transcriptionStatus ?? "nil", privacy: .public) outputMode=\(String(describing: request.output.outputMode), privacy: .public) textChars=\(request.text?.count ?? -1, privacy: .public) followUp=\(request.isAssistantFollowUp, privacy: .public)")
+        vippLog.info("deliver: enter status=\(request.transcription.transcriptionStatus ?? "nil", privacy: .public) outputMode=\(String(describing: request.output.outputMode), privacy: .public) textChars=\(request.text?.count ?? -1, privacy: .public) followUp=\(request.isAssistantFollowUp, privacy: .public) skip=\(request.skipPostProcessing, privacy: .public)")
+
+        // ── VIPP (skip-mode-processing feature) — RAW-PASTE GUARANTEE ────────────────
+        // This is THE decision point the user's "skip script" button must control:
+        // TranscriptionDelivery routes purely on request.output.outputMode below
+        // (.respond → deliverResponse, .customCommand → deliverCustomCommand/script,
+        // else → paste). If the one-shot skip flag is set, we DETERMINISTICALLY take the
+        // raw-paste branch here — bypassing both deliverCustomCommand (the Mode's shell
+        // script) and deliverResponse — regardless of what request.output.outputMode says.
+        // This closes the reported bug where the mode's script still ran with skip engaged:
+        // even if the upstream `.paste` override were ever lost, this branch forces raw paste.
+        // (Assistant follow-ups are a different flow entirely and never carry skip.)
+        if request.skipPostProcessing,
+           !request.isAssistantFollowUp,
+           request.transcription.transcriptionStatus == TranscriptionStatus.completed.rawValue {
+            vippLog.info("deliver: skipPostProcessing ON → FORCING raw paste (bypassing custom-command/respond) outputModeWas=\(String(describing: request.output.outputMode), privacy: .public)")
+            // The paste path consumes/clears the focus lock itself; nothing else to release.
+            if let text = request.text {
+                // Force a plain `.paste` config (strip any customCommand, keep autoSendKey)
+                // so paste()'s autoSendKey handling still works on the raw text.
+                let rawOutput = OutputRuntimeConfiguration(
+                    mode: request.output.mode,
+                    outputMode: .paste,
+                    autoSendKey: request.output.autoSendKey,
+                    customCommand: nil
+                )
+                await paste(text, output: rawOutput, actions: actions)
+            } else {
+                FocusLockService.shared.clearLock()
+                await actions.dismiss()
+            }
+            return
+        }
+
         // Feature A (focus lock): ONLY the paste path consumes a focus lock. Every
         // other delivery outcome below (incomplete transcription, assistant
         // follow-up, respond mode, custom command, or empty text) must release any

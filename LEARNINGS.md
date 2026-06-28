@@ -24,6 +24,16 @@ Each entry looks like:
 (newest first)
 
 ---
+**Date:** 2026-06-28T16:14:55Z
+**Trigger:** Ethan task 2026-06-28: skip-mode-processing button doesn't skip the script
+**Symptom:** skip-mode-processing button engaged (orange) but the Mode's custom-command/SCRIPT still ran after transcription (AI enhancement was bypassed, but deliverCustomCommand still fired)
+**Root cause:** skip was encoded ONLY indirectly by rewriting VoiceInkEngine.runPipeline's outputConfiguration closure to .paste; TranscriptionDelivery.deliver routes purely on request.output.outputMode and had NO skip flag, so any path where the final output value reached delivery as .customCommand (the fragile closure-rewrite-to-delivery hop) still ran the script. No script path exists outside TranscriptionDelivery.deliverCustomCommand (confirmed).
+**Fix:** Made skip AUTHORITATIVE and DETERMINISTIC: thread an explicit skipPostProcessing Bool from session → pipeline.run → TranscriptionDelivery.Request. Pipeline now FORCES outputForDelivery to raw .paste (customCommand nil) when skip is on, and gates enhancement/respond on it. TranscriptionDelivery.deliver short-circuits to the raw paste() branch when request.skipPostProcessing (bypassing deliverCustomCommand AND deliverResponse) regardless of outputMode. Also (Codex finding #2) skip now bypasses trigger-word mode-switching, paragraph formatting, and word-replacement so the transcript is truly RAW. Decisive VIPPDebug logs added at pipeline resolve + delivery decision.
+**Commit:** 50d0dab
+**Guard:** Belt-and-braces: bypass enforced at BOTH the pipeline output-resolution site AND the delivery router (request.skipPostProcessing). New default-valued params keep single callers compiling. VIPPDebug logs: 'pipeline: skipPostProcessing RESOLVED=true', 'pipeline: skip ON → output FORCED to raw .paste', 'deliver: skipPostProcessing ON → FORCING raw paste' confirm in Console.
+---
+
+---
 **Date:** 2026-06-28T15:55:13Z
 **Trigger:** Feature: skip-mode-processing one-shot toggle button next to Cancel
 **Symptom:** Needed a one-shot way to skip the active Mode's post-processing (AI enhancement + custom-command/script) for a SINGLE dictation and paste the raw transcript, without changing default settings
