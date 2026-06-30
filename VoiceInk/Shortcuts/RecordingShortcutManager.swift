@@ -60,6 +60,17 @@ class RecordingShortcutManager: ObservableObject {
     private var middleClickMonitors: [Any?] = []
     private var middleClickTask: Task<Void, Never>?
 
+    // ── Event-tap health monitoring (idle-miss bug fix) ──────────────────────────
+    // After the Mac has been idle for a while (App Nap throttling the main run loop) or
+    // after a system sleep/wake, the global record-hotkey CGEventTap can be left disabled.
+    // The reactive in-callback re-enable only fires once an event reaches the tap — so the
+    // FIRST press after idle gets eaten re-arming it instead of starting a recording
+    // (Ethan: "I have to press record ~4 times"). We proactively re-arm the tap on
+    // wake/unlock and via a low-frequency watchdog so the next press always works.
+    private var eventTapHealthObservers: [NSObjectProtocol] = []
+    private var eventTapWatchdog: Timer?
+    private let logger = Logger(subsystem: "com.prakashjoshipax.voiceink", category: "RecordingShortcutManager")
+
     enum Mode: String, CaseIterable {
         case toggle = "toggle"
         case pushToTalk = "pushToTalk"
@@ -176,8 +187,66 @@ class RecordingShortcutManager: ObservableObject {
             try? await Task.sleep(nanoseconds: 100_000_000)
             self.refreshShortcutMonitoring()
         }
+
+        // Start proactively re-arming the hotkey event tap on wake/unlock + via a watchdog
+        // so a long idle period can't leave the record hotkey dead on the first press.
+        setupEventTapHealthMonitoring()
     }
-    
+
+    // MARK: - Event-tap health monitoring (idle-miss bug fix)
+
+    private func setupEventTapHealthMonitoring() {
+        let workspaceCenter = NSWorkspace.shared.notificationCenter
+
+        // System wake from sleep, displays waking, and the login session becoming active
+        // are all moments when the CGEventTap may have been disabled by macOS. Re-check it.
+        let notifications: [Notification.Name] = [
+            NSWorkspace.didWakeNotification,
+            NSWorkspace.screensDidWakeNotification,
+            NSWorkspace.sessionDidBecomeActiveNotification
+        ]
+
+        for name in notifications {
+            let observer = workspaceCenter.addObserver(
+                forName: name,
+                object: nil,
+                queue: .main
+            ) { [weak self] _ in
+                // Hop to the MainActor explicitly: NSWorkspace delivers on .main but the
+                // closure isn't statically @MainActor-isolated.
+                MainActor.assumeIsolated {
+                    self?.shortcutMonitor.ensureEventTapHealthy(reason: name.rawValue)
+                }
+            }
+            eventTapHealthObservers.append(observer)
+        }
+
+        // Belt-and-suspenders watchdog: every 15s confirm the tap is still enabled. This
+        // catches any disable that didn't coincide with a wake notification. AppNapGuard
+        // keeps the main run loop alive so this timer actually fires while idle. Cheap:
+        // CGEvent.tapIsEnabled is a fast local check, no re-install unless actually needed.
+        let watchdog = Timer(timeInterval: 15.0, repeats: true) { [weak self] _ in
+            MainActor.assumeIsolated {
+                self?.shortcutMonitor.ensureEventTapHealthy(reason: "watchdog")
+            }
+        }
+        // .common mode so it keeps firing during menu tracking / modal run loops.
+        RunLoop.main.add(watchdog, forMode: .common)
+        eventTapWatchdog = watchdog
+
+        logger.notice("Event-tap health monitoring active (wake/unlock observers + 15s watchdog)")
+    }
+
+    private func teardownEventTapHealthMonitoring() {
+        let workspaceCenter = NSWorkspace.shared.notificationCenter
+        for observer in eventTapHealthObservers {
+            workspaceCenter.removeObserver(observer)
+        }
+        eventTapHealthObservers = []
+        eventTapWatchdog?.invalidate()
+        eventTapWatchdog = nil
+    }
+
     private func refreshShortcutMonitoring() {
         removeAllMonitoring()
         
@@ -339,6 +408,7 @@ class RecordingShortcutManager: ObservableObject {
         }
 
         MainActor.assumeIsolated {
+            teardownEventTapHealthMonitoring()
             removeAllMonitoring()
         }
     }

@@ -40,6 +40,13 @@ struct VoiceInkApp: App {
         // Disable HTTP response caching — prevents API responses from being stored in Cache.db
         URLCache.shared = URLCache(memoryCapacity: 0, diskCapacity: 0)
 
+        // Hold an app-lifetime activity assertion so macOS App Nap can't throttle our main
+        // run loop while the Mac is idle. Without this the global record-hotkey CGEventTap
+        // (whose run-loop source lives on the main run loop) gets disabled after a long idle
+        // period, so the first press(es) after idle do nothing. See AppNapGuard for the full
+        // explanation of the idle-miss bug. Must run first, before any heavy init work.
+        _ = AppNapGuard.shared
+
         AppDefaults.registerDefaults()
         OnboardingV2Migration.prepareIfNeeded()
 
