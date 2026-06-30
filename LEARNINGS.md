@@ -24,6 +24,16 @@ Each entry looks like:
 (newest first)
 
 ---
+**Date:** 2026-06-30T19:43:04Z
+**Trigger:** Ethan task 2026-06-30: idle-miss record hotkey bug
+**Symptom:** After Mac idle ~30-60 min, first few presses of the global record hotkey do nothing (must press ~4x) and the start of speech is clipped (no pre-roll buffer).
+**Root cause:** VoiceInk++ is a background/accessory app. The record-hotkey CGEventTap's run-loop source lives on the MAIN run loop (ShortcutMonitor.installEventTap -> CFRunLoopGetMain). With NO ProcessInfo activity assertion anywhere, macOS App Nap throttles the main run loop while idle -> tap stops being serviced -> macOS disables the slow tap -> the in-callback tapDisabledByTimeout re-enable is REACTIVE (only fires once an event reaches the dead tap), so the waking press(es) get consumed re-arming the tap instead of starting a recording. Separately, the AUHAL capture unit was only prepared on init/device-change (never on wake), so the first recording after idle cold-started the unit and clipped the first words (no pre-roll ring buffer).
+**Fix:** 3 prongs: (1) New VoiceInk/Services/AppNapGuard.swift holds an app-lifetime ProcessInfo.beginActivity(.userInitiatedAllowingIdleSystemSleep) so App Nap can't throttle the run loop (Mac can still idle-sleep); inited first in VoiceInkApp.init via _ = AppNapGuard.shared. (2) ShortcutMonitor.ensureEventTapHealthy(reason:) PROACTIVELY checks CGEvent.tapIsEnabled and re-enables, or reinstallEventTap() if the Mach port is invalid (CFMachPortIsValid); RecordingShortcutManager wires it to NSWorkspace didWake/screensDidWake/sessionDidBecomeActive + a 15s watchdog Timer on RunLoop.main .common. (3) Recorder.swift adds an NSWorkspace.didWakeNotification observer that re-prepares the AUHAL (schedulePrepareForCurrentDevice reason=wake) so capture is warm on the first post-wake press.
+**Commit:** PR #8 squash-merged to main
+**Guard:** Thorough inline comment blocks at each fix site naming the App-Nap-throttles-main-run-loop mechanism + reactive-vs-proactive tap re-enable + cold-start clipping. ensureEventTapHealthy guards on shortcuts non-empty + CFMachPortIsValid; watchdog uses tapIsEnabled fast-path (no reinstall unless needed). Wake re-prepare skips when deviceManager.isRecordingActive. AppNapGuard deliberately avoids .latencyCritical (overkill) and allows idle system sleep so we don't keep the Mac awake. Project uses PBXFileSystemSynchronizedRootGroup so new AppNapGuard.swift auto-compiles. NOT built on MBP (codesign dialogs) — Mini builds+signs. Base official VoiceInk untouched.
+---
+
+---
 **Date:** 2026-06-28T16:14:55Z
 **Trigger:** Ethan task 2026-06-28: skip-mode-processing button doesn't skip the script
 **Symptom:** skip-mode-processing button engaged (orange) but the Mode's custom-command/SCRIPT still ran after transcription (AI enhancement was bypassed, but deliverCustomCommand still fired)
