@@ -17,6 +17,16 @@ All in `VoiceInk/Modes/ActiveWindowService.swift` + a one-line wiring call in `V
 - **#784 — neutral nil-fallback.** When an app has no enabled matching Mode and there's no
   enabled+default Mode, `setActiveConfiguration(nil)` (neutral paste / no auto-send) instead of
   silently retaining the previous app's Mode.
+- **ChatGPT floating-window fix — resolve the KEYBOARD-focused app via Accessibility.** Adds
+  `accessibilityFocusedApplication()` to `ActiveWindowService` and uses it (with a
+  `frontmostApplication` fallback) inside `beginApplyingConfiguration`. The ChatGPT desktop app's
+  floating companion/quick-access window is a `.nonactivatingPanel`: it takes keyboard focus WITHOUT
+  changing `NSWorkspace.frontmostApplication` and WITHOUT firing `didActivateApplicationNotification`,
+  so neither the record-start read nor the #785 observer ever saw ChatGPT → its per-app Mode (incl.
+  auto-Enter) never activated and the menu-bar Mode indicator stayed wrong. The AX system-wide
+  focused element DOES follow into the panel, so we read its owning pid → bundle id. Safe/additive:
+  for ordinary windows the AX-focused app == frontmost app. Falls back when AX is untrusted, exposes
+  no focused element, or the focus is VoiceInk's own (also non-activating) recorder panel.
 
 `start()` is wired once at app launch in `VoiceInk.swift` (right after `ActiveWindowService.shared`).
 

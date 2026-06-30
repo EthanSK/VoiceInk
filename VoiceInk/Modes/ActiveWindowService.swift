@@ -1,5 +1,6 @@
 import Foundation
 import AppKit
+import ApplicationServices // AXUIElement* APIs — used to resolve the *keyboard-focused* app (see chatgpt-floating-window fix below)
 import os
 
 class ActiveWindowService: ObservableObject {
@@ -139,6 +140,89 @@ class ActiveWindowService: ObservableObject {
         }
     }
 
+    // MARK: - Keyboard-focused-app resolution (ChatGPT floating-window fix)
+    //
+    // THE BUG this guards against:
+    // The ChatGPT macOS app's floating "companion / quick-access" window (summoned
+    // with a global hotkey, floats over whatever app you're in) is a
+    // NON-ACTIVATING panel (.nonactivatingPanel, like Spotlight/an accessory window).
+    // macOS deliberately lets such a panel take KEYBOARD focus WITHOUT changing
+    // `NSWorkspace.shared.frontmostApplication` and WITHOUT firing
+    // `didActivateApplicationNotification`. So when Ethan dictates into that floating
+    // window, our two existing app-resolution paths both miss it:
+    //   • record-start read of `frontmostApplication` (beginApplyingConfiguration) →
+    //     still points at whatever real app was front BEHIND the panel, not ChatGPT.
+    //   • the live-follow observer (didActivateApplicationNotification) → never fires
+    //     for a non-activating panel, so it can't correct it either.
+    // Net effect: the per-app "ChatGPT mode" never activates → no auto-Enter, and the
+    // menu-bar "Mode:" indicator (MenuBarView reads currentEffectiveConfiguration)
+    // stays on the wrong mode. It only worked when ChatGPT's MAIN window was front
+    // (a normal window that DOES become frontmost).
+    //
+    // THE FIX:
+    // Ask the Accessibility API which app actually owns KEYBOARD focus. Unlike
+    // `frontmostApplication`, the system-wide AX focused element DOES follow into a
+    // non-activating panel, so it correctly reports ChatGPT (com.openai.chat) while
+    // that floating window is focused. We use this as the PRIMARY signal at
+    // record-start and fall back to `frontmostApplication` whenever AX can't help.
+    //
+    // WHY THIS IS SAFE / ADDITIVE for ordinary apps:
+    // For a normal window, the AX-focused app IS the frontmost app, so behavior is
+    // unchanged. We only diverge from the old logic in exactly the broken case
+    // (focus sitting in a non-activating panel). Reuses the same AX pattern already
+    // proven in FocusLockService.captureCandidate (system-wide element → pid → app).
+    //
+    // FALLBACK CASES (return nil → caller uses frontmostApplication):
+    //   • Accessibility not granted (AXIsProcessTrusted() == false).
+    //   • No system-wide focused element, or no resolvable owning app.
+    //   • The focused app is VoiceInk ITSELF — our own recorder windows are ALSO
+    //     non-activating panels, so we must never attribute focus to ourselves and
+    //     clobber the user's real target app's mode.
+    // Cheap + only called once per record-start (not polled), so no AX hammering.
+    private func accessibilityFocusedApplication() -> NSRunningApplication? {
+        // No Accessibility permission → can't read system-wide focus. Bail to the
+        // frontmost path. (VoiceInk already requests AX since it injects keystrokes.)
+        guard AXIsProcessTrusted() else { return nil }
+
+        let systemWide = AXUIElementCreateSystemWide()
+        var focusedRef: CFTypeRef?
+        let result = AXUIElementCopyAttributeValue(
+            systemWide,
+            kAXFocusedUIElementAttribute as CFString,
+            &focusedRef
+        )
+
+        // Some focus contexts don't expose a focused AX element — fall back.
+        guard result == .success, let focusedRef else { return nil }
+
+        // Successful read of kAXFocusedUIElementAttribute always yields an AXUIElement.
+        let element = focusedRef as! AXUIElement
+
+        // Map the focused element → owning process → NSRunningApplication so we can
+        // read its bundle id for per-app mode lookup.
+        var pid: pid_t = 0
+        guard AXUIElementGetPid(element, &pid) == .success,
+              let app = NSRunningApplication(processIdentifier: pid),
+              let bundleIdentifier = app.bundleIdentifier,
+              !bundleIdentifier.isEmpty,
+              !app.isTerminated else {
+            return nil
+        }
+
+        // Never attribute focus to VoiceInk itself (our recorder panels are also
+        // non-activating). Guard by both PID and bundle id, then fall back so the
+        // caller resolves the real target app via frontmostApplication instead.
+        if app.processIdentifier == ProcessInfo.processInfo.processIdentifier {
+            return nil
+        }
+        if let ownBundleIdentifier = Bundle.main.bundleIdentifier,
+           bundleIdentifier == ownBundleIdentifier {
+            return nil
+        }
+
+        return app
+    }
+
     @MainActor
     @discardableResult
     func beginApplyingConfiguration(
@@ -152,13 +236,22 @@ class ActiveWindowService: ObservableObject {
             return Task {}
         }
 
-        guard let frontmostApp = NSWorkspace.shared.frontmostApplication,
-              let bundleIdentifier = frontmostApp.bundleIdentifier else {
+        // Prefer the KEYBOARD-focused app (Accessibility) over the frontmost app, so
+        // dictating into a non-activating panel like ChatGPT's floating companion
+        // window correctly resolves to ChatGPT (com.openai.chat) and activates its
+        // per-app mode (incl. auto-Enter). Falls back to frontmostApplication when AX
+        // can't help (untrusted / no focused element / focus is VoiceInk itself).
+        // For ordinary windows these two are the same app, so this is non-breaking.
+        let activeApp = accessibilityFocusedApplication()
+            ?? NSWorkspace.shared.frontmostApplication
+
+        guard let activeApp,
+              let bundleIdentifier = activeApp.bundleIdentifier else {
             return Task {}
         }
 
         guard shouldApply() else { return Task {} }
-        currentApplication = frontmostApp
+        currentApplication = activeApp
 
         // Delegate to the shared resolver (app-config -> default -> neutral nil, plus
         // the async browser-URL override). This is the SAME logic the live-follow
