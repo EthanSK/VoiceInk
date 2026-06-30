@@ -58,6 +58,56 @@ final class ShortcutMonitor {
         return installEventTap()
     }
 
+    /// Proactively make sure the global hotkey event tap is installed AND enabled.
+    ///
+    /// ── WHY THIS EXISTS (idle-miss bug) ───────────────────────────────────────────
+    /// The in-callback re-enable on `.tapDisabledByTimeout` / `.tapDisabledByUserInput`
+    /// (see installEventTap) is REACTIVE: it only fires when an event finally reaches the
+    /// tap AFTER macOS has disabled it — and that waking event is consumed re-arming the
+    /// tap instead of starting a recording. After the Mac has been idle (App Nap throttling
+    /// the main run loop) or after a system sleep/wake, the tap can be left disabled with no
+    /// event in flight to trigger that reactive path. The result is Ethan's symptom: the
+    /// first press(es) after idle do nothing.
+    ///
+    /// This method is the PROACTIVE counterpart. Call it on wake/unlock and from a periodic
+    /// watchdog (see RecordingShortcutManager). It checks `CGEvent.tapIsEnabled` and:
+    ///   • re-enables the tap if it exists but is disabled, or
+    ///   • fully reinstalls it if the Mach port was invalidated.
+    /// So the NEXT press after idle starts a recording instead of being eaten.
+    func ensureEventTapHealthy(reason: String) {
+        guard !shortcuts.isEmpty else { return }
+
+        // Mach port gone entirely → rebuild from scratch.
+        guard let eventTap, CFMachPortIsValid(eventTap) else {
+            logger.notice("Event tap missing/invalid (reason=\(reason, privacy: .public)) — reinstalling")
+            reinstallEventTap()
+            return
+        }
+
+        // Port is valid but the tap may have been disabled by macOS while we were idle.
+        if !CGEvent.tapIsEnabled(tap: eventTap) {
+            logger.notice("Event tap was disabled (reason=\(reason, privacy: .public)) — re-enabling")
+            // Clear any stuck key-down state captured before the tap went quiet, otherwise a
+            // never-delivered key-up could leave a shortcut stuck "down".
+            resetPressedShortcutsAfterTapInterruption()
+            CGEvent.tapEnable(tap: eventTap, enable: true)
+        }
+    }
+
+    /// Tear down and rebuild the event tap + run-loop source. Used by ensureEventTapHealthy
+    /// when the Mach port has been invalidated (cannot just re-enable a dead port).
+    private func reinstallEventTap() {
+        if let eventTapRunLoopSource {
+            CFRunLoopRemoveSource(CFRunLoopGetMain(), eventTapRunLoopSource, .commonModes)
+            self.eventTapRunLoopSource = nil
+        }
+        if let eventTap {
+            CFMachPortInvalidate(eventTap)
+            self.eventTap = nil
+        }
+        _ = installEventTap()
+    }
+
     func stop() {
         if let eventTapRunLoopSource {
             CFRunLoopRemoveSource(CFRunLoopGetMain(), eventTapRunLoopSource, .commonModes)

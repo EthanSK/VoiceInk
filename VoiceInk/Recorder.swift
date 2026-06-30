@@ -2,6 +2,7 @@ import Foundation
 import AVFoundation
 import CoreAudio
 import os
+import AppKit
 
 @MainActor
 class Recorder: NSObject, ObservableObject {
@@ -10,6 +11,8 @@ class Recorder: NSObject, ObservableObject {
     private let deviceManager = AudioDeviceManager.shared
     private var deviceSwitchObserver: NSObjectProtocol?
     private var audioDeviceChangedObserver: NSObjectProtocol?
+    // Re-prepares the AUHAL after a system wake. See setupWakeObserver for the why.
+    private var wakeObserver: NSObjectProtocol?
     private var isReconfiguring = false
     private let mediaController = MediaController.shared
     private let playbackController = PlaybackController.shared
@@ -39,7 +42,33 @@ class Recorder: NSObject, ObservableObject {
         super.init()
         setupDeviceSwitchObserver()
         setupAudioDeviceChangedObserver()
+        setupWakeObserver()
         schedulePrepareForCurrentDevice(reason: "init")
+    }
+
+    /// Re-prepare the capture hardware after the Mac wakes from sleep.
+    ///
+    /// ── WHY (clipped-start-of-speech half of the idle-miss bug) ───────────────────
+    /// The AUHAL is prepared once at init (and on device changes) but NOT after a wake.
+    /// After a long idle period / system sleep the input device can go cold or its AUHAL
+    /// state can be torn down, so the FIRST recording cold-starts the unit and the first
+    /// few hundred ms of speech are lost (there is no pre-roll ring buffer). Ethan's
+    /// report: "there's no buffer — it just misses the start." Re-preparing on wake keeps
+    /// the unit warm so the first post-wake press captures from the very first word.
+    private func setupWakeObserver() {
+        wakeObserver = NSWorkspace.shared.notificationCenter.addObserver(
+            forName: NSWorkspace.didWakeNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            MainActor.assumeIsolated {
+                guard let self else { return }
+                // Don't disturb an in-progress recording; prepare() also early-returns if
+                // recording, but skipping here avoids needless setup churn on the audio queue.
+                guard !self.deviceManager.isRecordingActive else { return }
+                self.schedulePrepareForCurrentDevice(reason: "wake")
+            }
+        }
     }
 
     private func setupDeviceSwitchObserver() {
@@ -329,6 +358,9 @@ class Recorder: NSObject, ObservableObject {
         }
         if let observer = audioDeviceChangedObserver {
             NotificationCenter.default.removeObserver(observer)
+        }
+        if let observer = wakeObserver {
+            NSWorkspace.shared.notificationCenter.removeObserver(observer)
         }
         recorder?.teardown()
     }
